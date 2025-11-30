@@ -21,13 +21,16 @@ extern "C" {
   extern const lv_img_dsc_t RateOfTurn;
   extern const lv_img_dsc_t SlipBall;
   extern const lv_img_dsc_t Bank;
+  extern const lv_img_dsc_t SARIGlobe;
 }
 
 // ===== UI objects =====
 static lv_obj_t *bug_img        = nullptr; 
 static lv_obj_t *slipBall_img   = nullptr; 
 static lv_obj_t *rateOfTurn_img = nullptr; 
-static lv_obj_t *bank_img = nullptr;  
+static lv_obj_t *bank_img       = nullptr;  
+static lv_obj_t *globe_img      = nullptr;  
+
 
 // ===== Resolution (from your ST7701 config) =====
 #define DISP_WIDTH   480
@@ -35,7 +38,10 @@ static lv_obj_t *bank_img = nullptr;
 
 // ===== LVGL draw buffer =====
 static lv_disp_draw_buf_t draw_buf;
-static lv_color_t buf1[DISP_WIDTH * 40];
+
+// Use a single buffer of 64 lines (≈ 480 * 64 * 2 bytes = ~61 KB)
+#define BUF_LINES 64
+static lv_color_t buf1[DISP_WIDTH * BUF_LINES];
 
 // ===== LVGL -> Panel flush bridge =====
 static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
@@ -47,6 +53,14 @@ static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
   lv_disp_flush_ready(drv);
 }
 
+
+// ===== PITCH → vertical scroll config =====
+// Map ±90° pitch to ±180 px movement (2 px per degree). Tweak to taste.
+static constexpr int  PITCH_MAX_DEG      = 90;   // clamp range
+static constexpr int  PITCH_PX_PER_DEG   = 2;    // pixels per degree
+static constexpr int  PITCH_MAX_PX       = PITCH_MAX_DEG * PITCH_PX_PER_DEG;
+
+
 // ================= DCS-BIOS CALLBACKS =================
 // Each callback has its own inline mapping constants and clamp helper.
 
@@ -55,7 +69,7 @@ void onSaiSlipBallChange(unsigned int newValue) {
   // ===== Mapping config (inline) =====
   static constexpr long MID_CODE   = 32782;   // center code
   static constexpr long HALF_SPAN  = 32768;   // half-range
-  static constexpr int  MAX_X_PX   = 90;     // ±100 px horizontal travel
+  static constexpr int  MAX_X_PX   = 90;     // ±90 px horizontal travel
   static constexpr int  BASE_Y     = 160;     // baseline vertical position
   static constexpr float MAX_Y_UP  = 7.0f;    // total upward shift at max deflection (px)
   auto clampInt = [](int v, int lo, int hi){ return (v < lo) ? lo : (v > hi) ? hi : v; };
@@ -85,6 +99,7 @@ void onSaiBankChange(unsigned int newValue)
   angle_tenths = (angle_tenths + 1800) % 3600;
 
   lv_img_set_angle(bank_img, angle_tenths);
+  lv_img_set_angle(globe_img, angle_tenths);
 }
 DcsBios::IntegerBuffer saiBankBuffer(0x74e6, 0xffff, 0, onSaiBankChange);
 
@@ -119,6 +134,25 @@ void onSaiManPitchAdjChange(unsigned int newValue) {
 }
 DcsBios::IntegerBuffer saiManPitchAdjBuffer(0x74ea, 0xffff, 0, onSaiManPitchAdjChange);
 
+
+void onSaiPitchChange(unsigned int newValue) 
+{
+  // DCS-BIOS 0..65535 → pitch in tenths of a degree, mapped to -90.0..+90.0
+  // (If your actual range is wider/narrower, adjust PITCH_MAX_DEG above.)
+  long tenths = map((int)newValue, 0, 65535, -PITCH_MAX_DEG * 10, PITCH_MAX_DEG * 10);
+
+  // Convert to pixels and clamp
+  long y_px = (tenths * PITCH_PX_PER_DEG) / 10;   // tenths° → px
+  if (y_px < -PITCH_MAX_PX) y_px = -PITCH_MAX_PX;
+  if (y_px >  PITCH_MAX_PX) y_px =  PITCH_MAX_PX;
+
+  // Move the globe relative to screen center (positive = down)
+  // Rotation still comes from onSaiBankChange()
+  lv_obj_align(globe_img, LV_ALIGN_CENTER, 0, (int)y_px);
+}
+DcsBios::IntegerBuffer saiPitchBuffer(0x74e4, 0xffff, 0, onSaiPitchChange);
+
+
 // ======================================================
 
 void setup() {
@@ -134,9 +168,10 @@ void setup() {
   Backlight_Init();
   Set_Backlight(70);
 
-  // --- LVGL init ---
-  lv_init();
-  lv_disp_draw_buf_init(&draw_buf, buf1, nullptr, DISP_WIDTH * 40);
+
+// LVGL init
+lv_init();
+lv_disp_draw_buf_init(&draw_buf, buf1, nullptr, DISP_WIDTH * BUF_LINES);
 
   static lv_disp_drv_t disp_drv;
   lv_disp_drv_init(&disp_drv);
@@ -145,7 +180,7 @@ void setup() {
   disp_drv.draw_buf = &draw_buf;
   disp_drv.flush_cb = my_disp_flush;
   disp_drv.sw_rotate    = 1;
-  disp_drv.full_refresh = 1;
+  disp_drv.full_refresh = 0;
   disp_drv.rotated      = LV_DISP_ROT_180;
   lv_disp_drv_register(&disp_drv);
 
@@ -157,6 +192,15 @@ void setup() {
   lv_obj_set_style_bg_color(scr, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
 
+
+  // --- Globe (rotates with bank) ---
+  globe_img = lv_img_create(scr);
+  lv_img_set_src(globe_img, &SARIGlobe);
+  lv_obj_center(globe_img);
+  lv_img_set_pivot(globe_img, SARIGlobe.header.w / 2, SARIGlobe.header.h / 2); // center pivot
+  lv_obj_move_background(globe_img); // keep it behind foreground elements (optional)
+
+  
   // --- Background (ball art behind everything, if desired) ---
   lv_obj_t *sari_bg = lv_img_create(scr);
   lv_img_set_src(sari_bg, &SARIBackground);
@@ -198,9 +242,9 @@ void setup() {
 
 void loop() {
   // LVGL tick
-  lv_tick_inc(5);
+  lv_tick_inc(1);
   lv_timer_handler();
-  delay(5);
+  delay(1);
 
   // DCS-BIOS pump
   DcsBios::loop();
