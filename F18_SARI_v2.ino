@@ -1,4 +1,4 @@
-// F18_SARI_v2 — Simplified (fixed viewport, roll-compensated pitch, 3 px/°)
+// F18_SARI_v2 — ISR-safe (mailboxes), fixed viewport, roll-comp pitch (3 px/°)
 // ESP32-S3 + ST7701 480x480 + LVGL8 + DCS-BIOS
 // Globe art: 300x900 (vertical −90..+90°)
 
@@ -24,29 +24,28 @@ extern "C" {
   extern const lv_img_dsc_t VerticalPointer;
   extern const lv_img_dsc_t HorizontalPointer;
   extern const lv_img_dsc_t SARICaged;
-      
 }
 
 // ----------------- Config -----------------
 #define DISP_WIDTH   480
 #define DISP_HEIGHT  480
 
-static constexpr int  BUG_Y_OFFSET   = -18;   // -18
-static constexpr int  GLOBE_Y_OFFSET = -33;   // -33
+static constexpr int  BUG_Y_OFFSET   = -18;
+static constexpr int  GLOBE_Y_OFFSET = -33;
 
-static constexpr int  HP_X_OFFSET = -50;      // parked = -50 x -203
-static constexpr int  HP_Y_OFFSET = -50;     //  test = -50 x -50
+static constexpr int  HP_X_OFFSET = -50;    // base offset for horizontal pointer
+static constexpr int  HP_Y_OFFSET = -50;
 
-static constexpr int  VP_X_OFFSET = -27;      // parked = -27 x -69 
-static constexpr int  VP_Y_OFFSET = -80;      // test = -27 x -240
+static constexpr int  VP_X_OFFSET = -27;    // base offset for vertical pointer
+static constexpr int  VP_Y_OFFSET = -80;
 
-static constexpr int  SARICAGED_X_OFFSET = 157;  // caged = 155 x -95
-static constexpr int  SARICAGED_Y_OFFSET = -96;  // uncaged =
+static constexpr int  SARICAGED_X_OFFSET = 157;
+static constexpr int  SARICAGED_Y_OFFSET = -96;
 
 static constexpr int  PITCH_MAX_DEG  = 90;
 static constexpr int  PITCH_DIR      = +1;     // +1 = globe moves down on pitch up
 
-// 300x900 art => 900/180 = 5 px/°. We want half of 6 → 3 px/°  ==> scale = 0.6
+// 300x900 art => 900/180 = 5 px/°. We want 3 px/°  ==> scale = 0.6
 static constexpr float PITCH_SCALE   = 0.6f;   // 3 px/°
 static int             PITCH_PX_PER_DEG = 3;   // set in setup from art * scale
 static int             PITCH_MAX_PX      = PITCH_MAX_DEG * 3;
@@ -57,10 +56,14 @@ static constexpr float SLIP_MAX_Y_UP  = 7.0f;
 static constexpr int   ROT_MAX_X_PX   = 75;
 static constexpr int   ROT_BASE_Y     = 200;
 
+// Pointer travel ranges (relative motion added to the base offsets)
+static constexpr int   PTR_HOR_MAX_X_PX = 50;  // ± range for HorizontalPointer
+static constexpr int   PTR_VER_MAX_Y_PX = 80;  // ± range for VerticalPointer
+
 static constexpr long  DCS_MID_CODE   = 32782;
 static constexpr long  DCS_HALF_SPAN  = 32768;
 
-// Pivot fine-tune relative to image center (adjust if your disc isn’t perfectly centered in the PNG)
+// Pivot fine-tune relative to image center (adjust if your disc isn’t perfectly centered)
 static constexpr int   GLOBE_CAL_X    = 0;
 static constexpr int   GLOBE_CAL_Y    = 0;
 
@@ -69,24 +72,41 @@ static lv_disp_draw_buf_t draw_buf;
 #define BUF_LINES 64
 static lv_color_t buf1[DISP_WIDTH * BUF_LINES];
 
-static lv_obj_t *scr          = nullptr;
-static lv_obj_t *bug_img      = nullptr;
-static lv_obj_t *slipBall_img = nullptr;
-static lv_obj_t *rateOfTurn_img = nullptr;
-static lv_obj_t *bank_img     = nullptr;
-static lv_obj_t *globe_holder = nullptr;  // fixed viewport
-static lv_obj_t *globe_img    = nullptr;  // rotated & translated child
-static lv_obj_t *verticalPointer_img    = nullptr;
-static lv_obj_t *horizontalPointer_img    = nullptr;
-static lv_obj_t *sariCaged_img    = nullptr;
+static lv_obj_t *scr                = nullptr;
+static lv_obj_t *bug_img            = nullptr;
+static lv_obj_t *slipBall_img       = nullptr;
+static lv_obj_t *rateOfTurn_img     = nullptr;
+static lv_obj_t *bank_img           = nullptr;
+static lv_obj_t *globe_holder       = nullptr;  // fixed viewport
+static lv_obj_t *globe_img          = nullptr;  // rotated & translated child
+static lv_obj_t *verticalPointer_img   = nullptr;
+static lv_obj_t *horizontalPointer_img = nullptr;
+static lv_obj_t *sariCaged_img         = nullptr;
 
 // Geometry/cache
 static int globe_w = 0, globe_h = 0;
 static int globe_center_x = 0, globe_base_y = 0;
 
-// Attitude (tenths of degrees)
-static int current_pitch_x10 = 0;
-static int current_bank_x10  = 0;
+// ----------------- DCS -> UI Mailboxes (ISR writes; loop reads) -----------------
+static volatile int16_t  mb_pitch_x10   = 0;             // tenths of degrees
+static volatile int16_t  mb_bank_x10    = 0;             // tenths of degrees (0..3600, oriented)
+static volatile uint16_t mb_rot_raw     = DCS_MID_CODE;
+static volatile uint16_t mb_slip_raw    = DCS_MID_CODE;
+static volatile uint16_t mb_bug_raw     = DCS_MID_CODE;  // manual pitch bug
+static volatile uint16_t mb_cage_raw    = 0;             // 0..65535 for SARICaged
+static volatile int16_t  mb_pointerHor  = 0;             // pixels (−PTR_HOR_MAX_X_PX..+PTR_HOR_MAX_X_PX)
+static volatile int16_t  mb_pointerVer  = 0;             // pixels (−PTR_VER_MAX_Y_PX..+PTR_VER_MAX_Y_PX)
+static volatile bool     mb_dirty       = false;
+
+// UI copies (non-volatile)
+static int16_t  ui_pitch_x10 = 0;
+static int16_t  ui_bank_x10  = 0;
+static uint16_t ui_rot_raw   = DCS_MID_CODE;
+static uint16_t ui_slip_raw  = DCS_MID_CODE;
+static uint16_t ui_bug_raw   = DCS_MID_CODE;
+static uint16_t ui_cage_raw  = 0;
+static int16_t  ui_pointerHor = 0;
+static int16_t  ui_pointerVer = 0;
 
 // ----------------- Utils -----------------
 static inline int clampInt(int v, int lo, int hi) { return (v < lo) ? lo : (v > hi) ? hi : v; }
@@ -98,8 +118,8 @@ static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
 }
 
 // ----------------- Core: roll-compensated pitch -----------------
-static void update_globe_position() {
-  const int pitch_pixels = clampInt(PITCH_DIR * (current_pitch_x10 * PITCH_PX_PER_DEG) / 10,
+static void update_globe_position(int16_t pitch_x10, int16_t bank_x10) {
+  const int pitch_pixels = clampInt(PITCH_DIR * (pitch_x10 * PITCH_PX_PER_DEG) / 10,
                                     -PITCH_MAX_PX, PITCH_MAX_PX);
 
   const int pivot_x = (globe_w / 2) + GLOBE_CAL_X;
@@ -108,90 +128,163 @@ static void update_globe_position() {
   const int base_img_y = (globe_h / 2) - pivot_y;
 
   // Translate along bitmap’s local vertical axis to keep motion “up” relative to the rolled globe
-  const float bank_rad = current_bank_x10 * 0.0017453292519943296f; // pi/1800
+  const float bank_rad = bank_x10 * 0.0017453292519943296f; // pi/1800
   const int dx = (int)lrintf(-sinf(bank_rad) * pitch_pixels);
   const int dy = (int)lrintf( cosf(bank_rad) * pitch_pixels);
 
   lv_obj_set_pos(globe_img, base_img_x + dx, base_img_y + dy);
 }
 
-// ----------------- DCS-BIOS callbacks -----------------
-void onSaiSlipBallChange(unsigned int newValue) {
-  long delta = (long)newValue - DCS_MID_CODE;
-  long x = (DCS_HALF_SPAN != 0) ? (delta * SLIP_MAX_X_PX) / DCS_HALF_SPAN : 0;
-  x = clampInt((int)x, -SLIP_MAX_X_PX, SLIP_MAX_X_PX);
-  float ratio = (float)abs((int)x) / (float)SLIP_MAX_X_PX;
-  int y = SLIP_BASE_Y - (int)(ratio * SLIP_MAX_Y_UP);
-  lv_obj_align(slipBall_img, LV_ALIGN_CENTER, (int)x, y);
+// ----------------- DCS-BIOS callbacks (ISR-safe: NO LVGL HERE) -----------------
+void onSaiSlipBallChange(unsigned int v) {
+  mb_slip_raw = (uint16_t)v;
+  mb_dirty = true;
 }
 DcsBios::IntegerBuffer saiSlipBallBuffer(0x74ec, 0xffff, 0, onSaiSlipBallChange);
 
-void onSaiBankChange(unsigned int newValue) {
-  int angle_tenths = map((int)newValue, 0, 65535, 0, 3600);
-  angle_tenths = (angle_tenths + 1800) % 3600;  // panel orientation
-  current_bank_x10 = angle_tenths;
-
-  lv_img_set_angle(bank_img, angle_tenths);
-  lv_img_set_angle(globe_img, angle_tenths);
-  update_globe_position();
+void onSaiBankChange(unsigned int v) {
+  // 0..65535 → 0..3600 (tenths°), then rotate 180° for panel orientation
+  int32_t t = ((int32_t)v * 3600) / 65535;
+  t = (t + 1800) % 3600;
+  mb_bank_x10 = (int16_t)t;
+  mb_dirty = true;
 }
 DcsBios::IntegerBuffer saiBankBuffer(0x74e6, 0xffff, 0, onSaiBankChange);
 
-void onSaiRateOfTurnChange(unsigned int newValue) {
-  long delta = (long)newValue - DCS_MID_CODE;
-  long x = (DCS_HALF_SPAN != 0) ? (delta * ROT_MAX_X_PX) / DCS_HALF_SPAN : 0;
-  x = clampInt((int)x, -ROT_MAX_X_PX, ROT_MAX_X_PX);
-  lv_obj_align(rateOfTurn_img, LV_ALIGN_CENTER, (int)x, ROT_BASE_Y);
+void onSaiRateOfTurnChange(unsigned int v) {
+  mb_rot_raw = (uint16_t)v;
+  mb_dirty = true;
 }
 DcsBios::IntegerBuffer saiRateOfTurnBuffer(0x74ee, 0xffff, 0, onSaiRateOfTurnChange);
 
-void onSaiManPitchAdjChange(unsigned int newValue) {
-  static constexpr int MAX_PX = 35;
-  long delta = (long)newValue - DCS_MID_CODE;
-  long y = (DCS_HALF_SPAN != 0) ? (delta * MAX_PX) / DCS_HALF_SPAN : 0;
-  y = -y;
-  int y_out = clampInt((int)y, -MAX_PX, MAX_PX) + BUG_Y_OFFSET;
-  lv_obj_align(bug_img, LV_ALIGN_CENTER, 0, y_out);
+void onSaiManPitchAdjChange(unsigned int v) {
+  mb_bug_raw = (uint16_t)v;
+  mb_dirty = true;
 }
 DcsBios::IntegerBuffer saiManPitchAdjBuffer(0x74ea, 0xffff, 0, onSaiManPitchAdjChange);
 
-void onSaiPitchChange(unsigned int newValue) {
-  long tenths = map((int)newValue, 0, 65535, -PITCH_MAX_DEG * 10, PITCH_MAX_DEG * 10);
-  current_pitch_x10 = (int)tenths;
-  update_globe_position();
+void onSaiPitchChange(unsigned int v) {
+  // 0..65535 → -900..+900 tenths deg
+  mb_pitch_x10 = (int16_t)map((int)v, 0, 65535, -900, 900);
+  mb_dirty = true;
 }
 DcsBios::IntegerBuffer saiPitchBuffer(0x74e4, 0xffff, 0, onSaiPitchChange);
 
-
-void onSaiAttWarningFlagChange(unsigned int newValue) 
-{
-
-  static int16_t last_angle = 0;
-
-
-  // Map 0..65535 → 0..-900 (tenths of degrees)
-  int32_t target = -( (int32_t)newValue * 900 ) / 65535;
-
-  // Skip if change is tiny
-  if (abs(target - last_angle) < 5) return;
-
-  // Cancel any in-flight animation
-  lv_anim_del(sariCaged_img, (lv_anim_exec_xcb_t)lv_img_set_angle);
-
-  // Animate 0→-900 smoothly
-  lv_anim_t a;
-  lv_anim_init(&a);
-  lv_anim_set_var(&a, sariCaged_img);
-  lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)lv_img_set_angle);
-  lv_anim_set_values(&a, last_angle, target);
-  lv_anim_set_time(&a, 250);                      // ms duration
-  lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-  lv_anim_start(&a);
-
-  last_angle = (int16_t)target;
+// SARICaged (invert mapping so 0 -> -900, 65535 -> 0)
+void onSaiAttWarningFlagChange(unsigned int v) {
+  mb_cage_raw = (uint16_t)v;   // mapping/anim applied in UI thread
+  mb_dirty = true;
 }
 DcsBios::IntegerBuffer saiAttWarningFlagBuffer(0x74e8, 0xffff, 0, onSaiAttWarningFlagChange);
 
+// NEW: Horizontal pointer translation (−PTR_HOR_MAX_X_PX..+PTR_HOR_MAX_X_PX)
+void onSaiPointerHorChange(unsigned int v) {
+  long delta = (long)v - DCS_MID_CODE;
+  long x = (DCS_HALF_SPAN != 0) ? (delta * PTR_HOR_MAX_X_PX) / DCS_HALF_SPAN : 0;
+  x = clampInt((int)x, -PTR_HOR_MAX_X_PX, PTR_HOR_MAX_X_PX);
+  mb_pointerHor = (int16_t)x;
+  mb_dirty = true;
+}
+DcsBios::IntegerBuffer saiPointerHorBuffer(0x756c, 0xffff, 0, onSaiPointerHorChange);
+
+// NEW: Vertical pointer translation (−PTR_VER_MAX_Y_PX..+PTR_VER_MAX_Y_PX)
+void onSaiPointerVerChange(unsigned int v) {
+  long delta = (long)v - DCS_MID_CODE;
+  long y = (DCS_HALF_SPAN != 0) ? (delta * PTR_VER_MAX_Y_PX) / DCS_HALF_SPAN : 0;
+  y = -y; // nose-up should move up on screen
+  y = clampInt((int)y, -PTR_VER_MAX_Y_PX, PTR_VER_MAX_Y_PX);
+  mb_pointerVer = (int16_t)y;
+  mb_dirty = true;
+}
+DcsBios::IntegerBuffer saiPointerVerBuffer(0x756a, 0xffff, 0, onSaiPointerVerChange);
+
+// ----------------- Apply mailboxes in main thread (LVGL-safe) -----------------
+static void ui_apply_mailboxes() {
+  if (!mb_dirty) return;
+
+  noInterrupts();
+  int16_t  pitch_x10  = mb_pitch_x10;
+  int16_t  bank_x10   = mb_bank_x10;
+  uint16_t rot_raw    = mb_rot_raw;
+  uint16_t slip_raw   = mb_slip_raw;
+  uint16_t bug_raw    = mb_bug_raw;
+  uint16_t cage_raw   = mb_cage_raw;
+  int16_t  pHor       = mb_pointerHor;
+  int16_t  pVer       = mb_pointerVer;
+  mb_dirty = false;
+  interrupts();
+
+  // Store copies
+  ui_pitch_x10  = pitch_x10;
+  ui_bank_x10   = bank_x10;
+  ui_rot_raw    = rot_raw;
+  ui_slip_raw   = slip_raw;
+  ui_bug_raw    = bug_raw;
+  ui_cage_raw   = cage_raw;
+  ui_pointerHor = pHor;
+  ui_pointerVer = pVer;
+
+  // ---- Apply to LVGL (safe context) ----
+
+  // Bank rotation (scale & globe)
+  lv_img_set_angle(bank_img, ui_bank_x10);
+  lv_img_set_angle(globe_img, ui_bank_x10);
+
+  // Globe pitch translation (roll-compensated)
+  update_globe_position(ui_pitch_x10, ui_bank_x10);
+
+  // Rate of Turn lateral motion
+  {
+    long delta = (long)ui_rot_raw - DCS_MID_CODE;
+    long x = (DCS_HALF_SPAN != 0) ? (delta * ROT_MAX_X_PX) / DCS_HALF_SPAN : 0;
+    x = clampInt((int)x, -ROT_MAX_X_PX, ROT_MAX_X_PX);
+    lv_obj_align(rateOfTurn_img, LV_ALIGN_CENTER, (int)x, ROT_BASE_Y);
+  }
+
+  // Slip Ball (x + slight y rise when off-center)
+  {
+    long delta = (long)ui_slip_raw - DCS_MID_CODE;
+    long x = (DCS_HALF_SPAN != 0) ? (delta * SLIP_MAX_X_PX) / DCS_HALF_SPAN : 0;
+    x = clampInt((int)x, -SLIP_MAX_X_PX, SLIP_MAX_X_PX);
+    float ratio = (float)abs((int)x) / (float)SLIP_MAX_X_PX;
+    int y = SLIP_BASE_Y - (int)(ratio * SLIP_MAX_Y_UP);
+    lv_obj_align(slipBall_img, LV_ALIGN_CENTER, (int)x, y);
+  }
+
+  // Bug (manual pitch adjust)
+  {
+    static constexpr int MAX_PX = 35;
+    long delta = (long)ui_bug_raw - DCS_MID_CODE;
+    long y = (DCS_HALF_SPAN != 0) ? (delta * MAX_PX) / DCS_HALF_SPAN : 0;
+    y = -y;
+    int y_out = clampInt((int)y, -MAX_PX, MAX_PX) + BUG_Y_OFFSET;
+    lv_obj_align(bug_img, LV_ALIGN_CENTER, 0, y_out);
+  }
+
+  // NEW: Horizontal & Vertical pointer translation (relative to base offsets)
+  lv_obj_align(horizontalPointer_img, LV_ALIGN_CENTER,
+               HP_X_OFFSET + ui_pointerHor, HP_Y_OFFSET);
+
+  lv_obj_align(verticalPointer_img, LV_ALIGN_CENTER,
+               VP_X_OFFSET, VP_Y_OFFSET + ui_pointerVer);
+
+  // SARICaged animation (invert mapping so DCS 0 -> -900, 65535 -> 0)
+  {
+    static int16_t last_caged_angle = 0;
+    int16_t target = (int16_t)(-900 + ((int32_t)ui_cage_raw * 900) / 65535); // -900..0
+    if (abs(target - last_caged_angle) >= 5) {
+      lv_anim_del(sariCaged_img, (lv_anim_exec_xcb_t)lv_img_set_angle);
+      lv_anim_t a; lv_anim_init(&a);
+      lv_anim_set_var(&a, sariCaged_img);
+      lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)lv_img_set_angle);
+      lv_anim_set_values(&a, last_caged_angle, target);
+      lv_anim_set_time(&a, 250);
+      lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+      lv_anim_start(&a);
+      last_caged_angle = target;
+    }
+  }
+}
 
 // ----------------- Setup / Loop -----------------
 void setup() {
@@ -239,10 +332,12 @@ void setup() {
 
   globe_img = lv_img_create(globe_holder);
   lv_img_set_src(globe_img, &SARIGlobe);
-  const int pivot_x = (globe_w / 2) + GLOBE_CAL_X;
-  const int pivot_y = (globe_h / 2) + GLOBE_CAL_Y;
-  lv_img_set_pivot(globe_img, pivot_x, pivot_y);
-  lv_obj_set_pos(globe_img, (globe_w / 2) - pivot_x, (globe_h / 2) - pivot_y);
+  {
+    const int pivot_x = (globe_w / 2) + GLOBE_CAL_X;
+    const int pivot_y = (globe_h / 2) + GLOBE_CAL_Y;
+    lv_img_set_pivot(globe_img, pivot_x, pivot_y);
+    lv_obj_set_pos(globe_img, (globe_w / 2) - pivot_x, (globe_h / 2) - pivot_y);
+  }
 
   lv_obj_t *sari_bg = lv_img_create(scr);
   lv_img_set_src(sari_bg, &SARIBackground);
@@ -276,26 +371,31 @@ void setup() {
   sariCaged_img = lv_img_create(scr);
   lv_img_set_src(sariCaged_img, &SARICaged);
   lv_obj_align(sariCaged_img, LV_ALIGN_CENTER, SARICAGED_X_OFFSET, SARICAGED_Y_OFFSET);
-  // Set pivot to the top-right corner
-  lv_img_set_pivot(sariCaged_img, SARICaged.header.w, 0);
+  lv_img_set_pivot(sariCaged_img, SARICaged.header.w, 0); // top-right
+  lv_img_set_angle(sariCaged_img, 0);
 
+  // Init DCS-BIOS
   DcsBios::setup();
 
-  const unsigned int INIT = DCS_MID_CODE;
-  onSaiSlipBallChange(INIT);
-  onSaiRateOfTurnChange(INIT);
-  onSaiManPitchAdjChange(INIT);
-  onSaiPitchChange(INIT);
-  onSaiBankChange(INIT);
-
-
+  // Seed UI with neutral values and apply once
+  mb_pitch_x10 = 0;
+  mb_bank_x10  = 1800;
+  mb_rot_raw   = DCS_MID_CODE;
+  mb_slip_raw  = DCS_MID_CODE;
+  mb_bug_raw   = DCS_MID_CODE;
+  mb_cage_raw  = 0;
+  mb_pointerHor = 0;
+  mb_pointerVer = 0;
+  mb_dirty     = true;
+  ui_apply_mailboxes();
 }
 
 void loop() {
+  ui_apply_mailboxes();  // apply new DCS data (LVGL-safe)
+
   lv_tick_inc(5);
   lv_timer_handler();
   delay(5);
-  DcsBios::loop();
 
-
+  DcsBios::loop();       // callbacks only fill mailboxes
 }
