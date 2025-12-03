@@ -1,6 +1,6 @@
-// F18_SARI_v2 — ISR-safe (mailboxes), fixed viewport, roll-comp pitch (3 px/°)
+// F18_SARI_v2 
 // ESP32-S3 + ST7701 480x480 + LVGL8 + DCS-BIOS
-// Globe art: 300x900 (vertical −90..+90°)
+
 
 #define DCSBIOS_DEFAULT_SERIAL
 #define DCSBIOS_DISABLE_SERVO
