@@ -208,6 +208,8 @@ void onSaiPointerVerChange(unsigned int v) {
 }
 DcsBios::IntegerBuffer saiPointerVerBuffer(0x756a, 0xffff, 0, onSaiPointerVerChange);
 
+
+
 // ----------------- Apply mailboxes in main thread (LVGL-safe) -----------------
 static void ui_apply_mailboxes() {
   if (!mb_dirty) return;
