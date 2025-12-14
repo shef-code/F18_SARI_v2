@@ -4,7 +4,7 @@ F18 Standby Attitude and Roll Indicator Gauge
 
 This is still an early release.  Most functions work but the ILS needles have not been implemented.
 
-Uses: Waveshare ESP32-S3-Touch-LCD-2.8C  a 2.8" LCD without touchscreen.
+Uses: Waveshare ESP32-S3-LCD-2.8C  a 2.8" LCD without touchscreen.
 
 https://www.waveshare.com/esp32-s3-touch-lcd-2.8c.htm?sku=30254
 
