@@ -157,26 +157,9 @@ void onSaiManPitchAdjChange(unsigned int v) {
 }
 DcsBios::IntegerBuffer saiManPitchAdjBuffer(0x74ea, 0xffff, 0, onSaiManPitchAdjChange);
 
-static int16_t current_caged_angle = -900;
+// DCS already sends the flag position as a smooth sweep, so it is applied as it arrives.
 void onSaiAttWarningFlagChange(unsigned int v) {
-  const int16_t target = (int16_t)mapInt((uint16_t)v, 0, 65535, -900, 0);
-
-  if (abs(target - current_caged_angle) < 8) {
-    lv_img_set_angle(caged_img, target);
-    current_caged_angle = target;
-    return;
-  }
-
-  lv_anim_t a;
-  lv_anim_init(&a);
-  lv_anim_set_var(&a, caged_img);
-  lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)lv_img_set_angle);
-  lv_anim_set_values(&a, current_caged_angle, target);
-  lv_anim_set_time(&a, 280);
-  lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-  lv_anim_start(&a);
-
-  current_caged_angle = target;
+  lv_img_set_angle(caged_img, (int16_t)mapInt((uint16_t)v, 0, 65535, -900, 0));
 }
 DcsBios::IntegerBuffer saiAttWarningFlagBuffer(0x74e8, 0xffff, 0, onSaiAttWarningFlagChange);
 
@@ -388,7 +371,6 @@ void setup() {
   lv_img_set_src(caged_img, &SARICaged);
   lv_obj_align(caged_img, LV_ALIGN_CENTER, CAGED_X_OFFSET, CAGED_Y_OFFSET);
   lv_img_set_pivot(caged_img, SARICaged.header.w, SARICaged.header.h);
-  lv_img_set_angle(caged_img, 900);
 
 #if !SARI_DEMO_MODE
   // DCS-BIOS is only read between frames, and at 250000 baud a frame's worth of data overflows the default
