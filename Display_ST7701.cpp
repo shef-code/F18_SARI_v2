@@ -3,6 +3,8 @@
 spi_device_handle_t SPI_handle = NULL;     
 esp_lcd_panel_handle_t panel_handle = NULL;
 static SemaphoreHandle_t frame_done_sem = NULL;
+static volatile uint32_t frames_sent = 0;             // whole frames the panel has finished sending, counted in its interrupt
+static uint32_t shown_at = 0, shown_before_at = 0;    // frames_sent just after the last two LCD_showFrameBuffer calls
 static bool on_frame_buf_complete(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *event_data, void *user_data);
 void ST7701_WriteCommand(uint8_t cmd)
 {
@@ -387,21 +389,32 @@ void ST7701_Init()
 static bool on_frame_buf_complete(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *event_data, void *user_data)
 {
   BaseType_t high_task_awoken = pdFALSE;
+  frames_sent++;
   xSemaphoreGiveFromISR(frame_done_sem, &high_task_awoken);
   return high_task_awoken == pdTRUE;
 }
 
-void LCD_getFrameBuffers(void **fb0, void **fb1) {
-  esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 2, fb0, fb1);
+void LCD_getFrameBuffers(void **fb0, void **fb1, void **fb2) {
+  esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 3, fb0, fb1, fb2);
 }
 
-// Shows the given frame buffer (one of the two from LCD_getFrameBuffers). The panel switches to it at the start
-// of its next refresh, so a half-drawn frame is never displayed. Returns once the previously shown buffer is no
-// longer being read by the panel and is safe to draw into.
+// Shows the given frame buffer (one of the three from LCD_getFrameBuffers). The panel switches to it at the start
+// of its next refresh, so a half-drawn frame is never displayed. Returns at once: until that switch the panel is
+// still reading the buffer shown before, which must not be drawn into. The third buffer is the one to draw into
+// next, after LCD_waitForSpareFrameBuffer().
 void LCD_showFrameBuffer(void *fb) {
-  xSemaphoreTake(frame_done_sem, 0);                                    // discard a stale signal
   esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, ESP_PANEL_LCD_WIDTH, ESP_PANEL_LCD_HEIGHT, fb);
-  xSemaphoreTake(frame_done_sem, pdMS_TO_TICKS(50));                    // timeout so a missed signal cannot hang the gauge
+  shown_before_at = shown_at;
+  shown_at = frames_sent;
+}
+
+// Returns once the panel has finished a frame since the LCD_showFrameBuffer call before the last one. From then
+// on it reads only the last or the second-to-last buffer shown, so the remaining one is safe to draw into.
+// Frames normally take longer to draw than the panel takes to refresh, so this rarely has to wait.
+void LCD_waitForSpareFrameBuffer() {
+  while (frames_sent == shown_before_at) {
+    if (xSemaphoreTake(frame_done_sem, pdMS_TO_TICKS(50)) != pdTRUE) break;   // timeout so a missed signal cannot hang the gauge
+  }
 }
 void LCD_Init() {
   ST7701_Reset();

@@ -43,7 +43,7 @@ extern uint8_t LCD_Backlight;
 #define ESP_PANEL_LCD_RGB_PCLK_ACTIVE_NEG         (0)     // 0: rising edge, 1: falling edge
 #define ESP_PANEL_LCD_RGB_DATA_WIDTH              (16)
 #define ESP_PANEL_LCD_RGB_PIXEL_BITS              (16)    // 24 | 16
-#define ESP_PANEL_LCD_RGB_FRAME_BUF_NUM           (2)     // 1/2/3. Two: LVGL draws into the hidden one, then they swap (no tearing)
+#define ESP_PANEL_LCD_RGB_FRAME_BUF_NUM           (3)     // 1/2/3. Three: one on screen, one waiting to go on screen, one to draw into (no tearing, no waiting)
 #define ESP_PANEL_LCD_RGB_BOUNCE_BUF_SIZE         (10 * ESP_PANEL_LCD_HEIGHT)     // Bounce buffer size in bytes. This function is used to avoid screen drift.
                                                           // To enable the bounce buffer, set it to a non-zero value. Typically set to `ESP_PANEL_LCD_WIDTH * 10`
                                                           // The size of the Bounce Buffer must satisfy `width_of_lcd * height_of_lcd = size_of_buffer * N`,
@@ -84,8 +84,9 @@ extern esp_lcd_panel_handle_t panel_handle;
 void ST7701_Init();
 
 void LCD_Init();
-void LCD_getFrameBuffers(void **fb0, void **fb1);
+void LCD_getFrameBuffers(void **fb0, void **fb1, void **fb2);
 void LCD_showFrameBuffer(void *fb);
+void LCD_waitForSpareFrameBuffer();
 void LCD_addWindow(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yend,uint8_t* color);
 
 // backlight

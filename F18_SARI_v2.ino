@@ -188,18 +188,19 @@ DcsBios::IntegerBuffer saiAttWarningFlagBuffer(0x74e8, 0xffff, 0, onSaiAttWarnin
 static uint32_t prof_flush_us = 0, prof_flush_px = 0, prof_flush_n = 0;
 static uint32_t prof_copy_us = 0, prof_show_us = 0, prof_sync_us = 0;
 #endif
-// The panel has two frame buffers: the one on screen and a hidden one. LVGL renders into its own buffer in fast
-// internal RAM, and this copies each finished piece into the hidden frame buffer. After the last piece of a frame
-// the two are swapped at the panel's next refresh, so nothing half-drawn reaches the screen.
-// The buffer that is now hidden still holds the frame before, so the areas just drawn are stale in it. They are
-// remembered here and refresh_display() has LVGL redraw them on the next frame (copying them across from the
-// other frame buffer was measured at about 44 ms per frame, because it reads and writes PSRAM at once).
-static lv_color_t *fb_front = nullptr, *fb_back = nullptr;
+// The panel has three frame buffers: the one handed to the panel last (fb_front), the one handed to it before
+// that (fb_spare), which it may still be showing until its next refresh, and one to draw into (fb_back). LVGL
+// renders into its own buffer in fast internal RAM, and this copies each finished piece into fb_back. After the
+// last piece of a frame fb_back is handed to the panel, which switches to it at its next refresh, so nothing
+// half-drawn reaches the screen, and drawing carries on in the third buffer without waiting for that switch.
+// The buffer drawn into next is two frames old, so it is missing whatever the last two frames drew. Those areas
+// are remembered here and refresh_display() copies them across before the next frame is drawn.
+static lv_color_t *fb_front = nullptr, *fb_back = nullptr, *fb_spare = nullptr;
 constexpr int MAX_FRAME_AREAS = 12;
 static lv_area_t frame_areas[MAX_FRAME_AREAS];   // areas drawn into fb_back during the current frame
 static int frame_area_cnt = 0;
-static lv_area_t stale_areas[MAX_FRAME_AREAS];   // areas of the frame just shown, missing from the hidden buffer
-static int stale_area_cnt = 0;
+static lv_area_t stale_areas[2][MAX_FRAME_AREAS];   // areas drawn by the last frame [0] and the one before [1]
+static int stale_area_cnt[2] = { 0, 0 };
 static bool frame_shown = false;
 
 static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *buf) {
@@ -228,7 +229,8 @@ static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
     prof_show_us += micros() - t1;
 #endif
     lv_color_t *shown = fb_back;
-    fb_back = fb_front;
+    fb_back = fb_spare;
+    fb_spare = fb_front;
     fb_front = shown;
     frame_shown = true;
   }
@@ -257,8 +259,9 @@ static void refresh_display() {
 #if SARI_PROFILE
   const uint32_t t0 = micros();
 #endif
-  for (int i = 0; i < stale_area_cnt; i++) {
-    const lv_area_t *a = &stale_areas[i];
+  LCD_waitForSpareFrameBuffer();                   // the panel may still be reading fb_back
+  for (int i = 0; i < stale_area_cnt[0] + stale_area_cnt[1]; i++) {
+    const lv_area_t *a = i < stale_area_cnt[0] ? &stale_areas[0][i] : &stale_areas[1][i - stale_area_cnt[0]];
     // Whatever this refresh is about to redraw anyway need not be copied. Find the pending redraw area that
     // overlaps this stale area most, and copy only the up to four strips of the stale area outside it.
     lv_area_t cut;
@@ -278,22 +281,24 @@ static void refresh_display() {
 #if SARI_PROFILE
   prof_sync_us += micros() - t0;
 #endif
-  stale_area_cnt = 0;
   frame_area_cnt = 0;
   frame_shown = false;
 
   _lv_disp_refr_timer(nullptr);
 
   if (frame_shown) {
-    memcpy(stale_areas, frame_areas, sizeof(lv_area_t) * frame_area_cnt);
-    stale_area_cnt = frame_area_cnt;
+    memcpy(stale_areas[1], stale_areas[0], sizeof(lv_area_t) * stale_area_cnt[0]);
+    stale_area_cnt[1] = stale_area_cnt[0];
+    memcpy(stale_areas[0], frame_areas, sizeof(lv_area_t) * frame_area_cnt);
+    stale_area_cnt[0] = frame_area_cnt;
   }
 }
 
 // ────────────────────────────── Setup ──────────────────────────────
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
+#if SARI_DEMO_MODE
+  Serial.begin(115200);        // only for the SARI_PROFILE output; DcsBios::setup() opens the port otherwise
+#endif
 
   I2C_Init();
   TCA9554PWR_Init(0x00);
@@ -304,10 +309,11 @@ void setup() {
 
   lv_init();
 
-  void *fb0 = nullptr, *fb1 = nullptr;
-  LCD_getFrameBuffers(&fb0, &fb1);
+  void *fb0 = nullptr, *fb1 = nullptr, *fb2 = nullptr;
+  LCD_getFrameBuffers(&fb0, &fb1, &fb2);
   fb_front = (lv_color_t *)fb0;   // the panel starts by showing its first frame buffer
   fb_back  = (lv_color_t *)fb1;
+  fb_spare = (lv_color_t *)fb2;
 
   static lv_color_t buf[DISP_W * 192];
   static lv_disp_draw_buf_t draw_buf;
@@ -385,6 +391,9 @@ void setup() {
   lv_img_set_angle(caged_img, 900);
 
 #if !SARI_DEMO_MODE
+  // DCS-BIOS is only read between frames, and at 250000 baud a frame's worth of data overflows the default
+  // 256-byte buffer. Must be set before DcsBios::setup(), which opens the port.
+  Serial.setRxBufferSize(4096);
   DcsBios::setup();
 #endif
 
