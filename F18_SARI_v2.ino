@@ -13,6 +13,9 @@
 // For FPS numbers also set SARI_PERF_MONITOR to 1 in lv_conf.h.
 #define SARI_DEMO_MODE 0
 
+// Globe drawing: 1 = custom renderer (GlobeRenderer.h), 0 = LVGL rotated image with the bezel blended over it.
+#define SARI_GLOBE_RENDERER 1
+
 #include <Arduino.h>
 #include <DcsBios.h>
 #include <lvgl.h>
@@ -20,6 +23,7 @@
 #include "I2C_Driver.h"
 #include "TCA9554PWR.h"
 #include "Display_ST7701.h"
+#include "GlobeRenderer.h"
 
 extern "C" {
   extern const lv_img_dsc_t SARIBackground, SARIBug, RateOfTurn, SlipBall;
@@ -54,7 +58,8 @@ constexpr uint16_t DCS_MID  = 32782;
 constexpr uint16_t DCS_HALF = 32768;
 
 // ────────────────────────────── LVGL Objects ──────────────────────────────
-static lv_obj_t *globe_img = nullptr;
+static lv_obj_t *globe_img = nullptr;   // only when the LVGL globe is in use
+static bool use_globe_renderer = false;
 static lv_obj_t *bank_img  = nullptr;
 static lv_obj_t *bug_img   = nullptr;
 static lv_obj_t *slip_img  = nullptr;
@@ -78,10 +83,14 @@ static inline int mapInt(uint16_t v, uint16_t inMin, uint16_t inMax, int outMin,
 
 // ────────────────────────────── Globe Update ──────────────────────────────
 static inline void update_globe() {
-  if (!globe_img) return;
-
   const float pitch_px = (pitch_x10 / 10.0f) * (float)PITCH_DIR * (float)pitch_px_per_deg;
   const float bank_rad = (float)bank_x10 * 0.0017453292519943296f; // deg*10 -> radians
+
+  if (use_globe_renderer) {
+    globe_renderer::set_attitude(pitch_px, bank_rad);
+    return;
+  }
+  if (!globe_img) return;
 
   const float s = sinf(bank_rad);
   const float c = cosf(bank_rad);
@@ -103,7 +112,7 @@ void onSaiBankChange(unsigned int v) {
   bank_x10 = mapInt((uint16_t)v, 0, 65535, 0, 3600);
   const int16_t angle = (int16_t)(bank_x10 % 3600); // keep your original behavior
   lv_img_set_angle(bank_img,  angle);
-  lv_img_set_angle(globe_img, angle);
+  if (globe_img) lv_img_set_angle(globe_img, angle);
   update_globe();
 }
 DcsBios::IntegerBuffer saiBankBuffer(0x74e6, 0xffff, 0, onSaiBankChange);
@@ -232,7 +241,14 @@ static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
 }
 
 // Runs one LVGL screen refresh. The sketch drives this itself (LVGL's own refresh timer is removed in setup)
-// so that the stale areas of the hidden frame buffer can be added to the redraw list first.
+// so that the hidden frame buffer can be brought up to date first.
+// Copies a rectangle from the shown frame buffer to the hidden one. Does nothing for an empty rectangle.
+static void sync_rect(int x1, int y1, int x2, int y2) {
+  if (x2 < x1 || y2 < y1) return;
+  const size_t bytes = (x2 - x1 + 1) * sizeof(lv_color_t);
+  for (int y = y1; y <= y2; y++) memcpy(fb_back + y * DISP_W + x1, fb_front + y * DISP_W + x1, bytes);
+}
+
 static void refresh_display() {
   lv_disp_t *disp = lv_disp_get_default();
   if (disp->inv_p == 0) return;                    // nothing changed, leave both frame buffers alone
@@ -243,10 +259,21 @@ static void refresh_display() {
 #endif
   for (int i = 0; i < stale_area_cnt; i++) {
     const lv_area_t *a = &stale_areas[i];
-    const int w = lv_area_get_width(a);
-    for (int y = a->y1; y <= a->y2; y++) {
-      memcpy(fb_back + y * DISP_W + a->x1, fb_front + y * DISP_W + a->x1, w * sizeof(lv_color_t));
+    // Whatever this refresh is about to redraw anyway need not be copied. Find the pending redraw area that
+    // overlaps this stale area most, and copy only the up to four strips of the stale area outside it.
+    lv_area_t cut;
+    int32_t best = 0;
+    for (int j = 0; j < disp->inv_p; j++) {
+      lv_area_t common;
+      if (!_lv_area_intersect(&common, a, &disp->inv_areas[j])) continue;
+      const int32_t size = (int32_t)lv_area_get_size(&common);
+      if (size > best) { best = size; cut = common; }
     }
+    if (best == 0) { sync_rect(a->x1, a->y1, a->x2, a->y2); continue; }
+    sync_rect(a->x1, a->y1, a->x2, cut.y1 - 1);              // above
+    sync_rect(a->x1, cut.y2 + 1, a->x2, a->y2);              // below
+    sync_rect(a->x1, cut.y1, cut.x1 - 1, cut.y2);            // left
+    sync_rect(cut.x2 + 1, cut.y1, a->x2, cut.y2);            // right
   }
 #if SARI_PROFILE
   prof_sync_us += micros() - t0;
@@ -308,32 +335,44 @@ void setup() {
   constexpr int GLOBE_VP_W = 275;
   constexpr int GLOBE_VP_H = 275;
 
-  lv_obj_t *holder = lv_obj_create(scr);
-  lv_obj_remove_style_all(holder);
-  lv_obj_set_size(holder, GLOBE_VP_W, GLOBE_VP_H);
-  lv_obj_center(holder);
-  lv_obj_set_y(holder, GLOBE_Y_OFFSET);
-  lv_obj_set_scrollbar_mode(holder, LV_SCROLLBAR_MODE_OFF); // keep
-
   pivot_x = globe_w / 2 + GLOBE_CAL_X;
   pivot_y = globe_h / 2 + GLOBE_CAL_Y;
 
-  base_globe_x = (GLOBE_VP_W / 2) - pivot_x;
-  base_globe_y = (GLOBE_VP_H / 2) - pivot_y;
+#if SARI_GLOBE_RENDERER
+  // One object draws the bezel and the globe. Same window rectangle as the LVGL holder below.
+  use_globe_renderer = globe_renderer::create(scr, &SARIBackground, &SARIGlobe,
+                                              (DISP_W - GLOBE_VP_W) / 2, (DISP_H - GLOBE_VP_H) / 2 + GLOBE_Y_OFFSET,
+                                              pivot_x, pivot_y) != nullptr;
+#endif
+  if (!use_globe_renderer) {
+    lv_obj_t *holder = lv_obj_create(scr);
+    lv_obj_remove_style_all(holder);
+    lv_obj_set_size(holder, GLOBE_VP_W, GLOBE_VP_H);
+    lv_obj_center(holder);
+    lv_obj_set_y(holder, GLOBE_Y_OFFSET);
+    lv_obj_set_scrollbar_mode(holder, LV_SCROLLBAR_MODE_OFF); // keep
 
-  globe_img = lv_img_create(holder);
-  lv_img_set_src(globe_img, &SARIGlobe);
-  lv_img_set_pivot(globe_img, pivot_x, pivot_y);
-  lv_obj_set_pos(globe_img, base_globe_x, base_globe_y);
+    base_globe_x = (GLOBE_VP_W / 2) - pivot_x;
+    base_globe_y = (GLOBE_VP_H / 2) - pivot_y;
 
-  lv_obj_t *bg = lv_img_create(scr);
-  lv_img_set_src(bg, &SARIBackground);
-  lv_obj_center(bg);
+    globe_img = lv_img_create(holder);
+    lv_img_set_src(globe_img, &SARIGlobe);
+    lv_img_set_pivot(globe_img, pivot_x, pivot_y);
+    lv_obj_set_pos(globe_img, base_globe_x, base_globe_y);
+
+    lv_obj_t *bg = lv_img_create(scr);
+    lv_img_set_src(bg, &SARIBackground);
+    lv_obj_center(bg);
+  }
 
   bank_img = lv_img_create(scr);
   lv_img_set_src(bank_img, &Bank);
-  lv_obj_align(bank_img, LV_ALIGN_CENTER, 0, BANK_Y_OFFSET);
-  lv_img_set_pivot(bank_img, Bank.header.w / 2, Bank.header.h / 2);
+  // Bank.c holds only the pointer triangle (22x28), cut from the top of the original 22x312 image. It is placed
+  // where the top of that image was and pivots about where its centre was, which is outside this image, so the
+  // pointer follows the same arc while LVGL only redraws a small area.
+  constexpr int BANK_FULL_H = 312;
+  lv_obj_set_pos(bank_img, (DISP_W - Bank.header.w) / 2, (DISP_H - BANK_FULL_H) / 2 + BANK_Y_OFFSET);
+  lv_img_set_pivot(bank_img, Bank.header.w / 2, BANK_FULL_H / 2);
 
   bug_img  = lv_img_create(scr); lv_img_set_src(bug_img,  &SARIBug);     lv_obj_align(bug_img,  LV_ALIGN_CENTER, 0, BUG_Y_OFFSET);
   slip_img = lv_img_create(scr); lv_img_set_src(slip_img, &SlipBall);    lv_obj_align(slip_img, LV_ALIGN_CENTER, 0, SLIP_BASE_Y);
@@ -407,12 +446,12 @@ void loop() {
   p_lvgl_us += micros() - h0;
   if (frame_shown) { p_frames++; frame_shown = false; }
   if (millis() - p_last >= 2000) {
-    Serial.printf("PROF frames=%lu, lvgl=%lu us, flush=%lu us (copy=%lu, swap=%lu), sync=%lu us, %lu flushes, %lu px\n",
+    Serial.printf("PROF frames=%lu, lvgl=%lu us, flush=%lu us (copy=%lu, swap=%lu), sync=%lu us, globe=%lu us, %lu flushes, %lu px\n",
                   (unsigned long)p_frames, (unsigned long)p_lvgl_us, (unsigned long)prof_flush_us,
-                  (unsigned long)prof_copy_us, (unsigned long)prof_show_us, (unsigned long)prof_sync_us,
+                  (unsigned long)prof_copy_us, (unsigned long)prof_show_us, (unsigned long)prof_sync_us, (unsigned long)globe_renderer::prof_draw_us,
                   (unsigned long)prof_flush_n, (unsigned long)prof_flush_px);
     p_last = millis(); p_lvgl_us = p_frames = 0;
-    prof_flush_us = prof_flush_px = prof_flush_n = prof_copy_us = prof_show_us = prof_sync_us = 0;
+    prof_flush_us = prof_flush_px = prof_flush_n = prof_copy_us = prof_show_us = prof_sync_us = 0; globe_renderer::prof_draw_us = 0;
   }
 #else
   run_lvgl();
