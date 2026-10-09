@@ -28,6 +28,7 @@
 extern "C" {
   extern const lv_img_dsc_t SARIBackground, SARIBug, RateOfTurn, SlipBall;
   extern const lv_img_dsc_t Bank, SARIGlobe, SARICaged;
+  extern const lv_img_dsc_t VerticalPointer, HorizontalPointer;
 }
 
 // ────────────────────────────── Config ──────────────────────────────
@@ -54,14 +55,23 @@ constexpr int  GLOBE_CAL_Y        = 0;
 
 constexpr int BUG_MAX_TRAVEL_PX = 70;    
 
+// ILS needles. A needle is centred at the middle of the DCS range and slides ILS_TRAVEL_PX each way; at either end
+// of the range it is out of the window, behind the bezel. Positive direction is +x / +y on the LVGL screen, which
+// is mounted upside down. Travel and directions are first guesses, to be set by comparing with DCS (task F1).
+constexpr int  ILS_TRAVEL_PX      = 150;
+constexpr int  ILS_VER_DIR        = -1;   // vertical needle (moves sideways)
+constexpr int  ILS_HOR_DIR        = +1;    // horizontal needle (moves up and down)
+constexpr uint32_t ILS_COLOUR     = 0x9A682C;   // horizontal needle; the vertical needle image carries this colour
+
 constexpr uint16_t DCS_MID  = 32782;
 constexpr uint16_t DCS_HALF = 32768;
 
 // ────────────────────────────── LVGL Objects ──────────────────────────────
 static lv_obj_t *globe_img = nullptr;   // only when the LVGL globe is in use
 static bool use_globe_renderer = false;
+static int layer_bug = -1;              // the aircraft symbol as a globe renderer layer, under the ILS needles
 static lv_obj_t *bank_img  = nullptr;
-static lv_obj_t *bug_img   = nullptr;
+static lv_obj_t *bug_img   = nullptr;   // only when the aircraft symbol is not drawn by the globe renderer
 static lv_obj_t *slip_img  = nullptr;
 static lv_obj_t *rot_img   = nullptr;
 static lv_obj_t *caged_img = nullptr;
@@ -153,7 +163,9 @@ void onSaiManPitchAdjChange(unsigned int v) {
   // Clamp and apply your neutral offset
   y = constrain(y, -BUG_MAX_TRAVEL_PX, BUG_MAX_TRAVEL_PX) + BUG_Y_OFFSET;
 
-  lv_obj_align(bug_img, LV_ALIGN_CENTER, 0, y);
+  if (bug_img) lv_obj_align(bug_img, LV_ALIGN_CENTER, 0, y);
+  else globe_renderer::set_layer_pos(layer_bug, (DISP_W - SARIBug.header.w) / 2 - globe_renderer::win_x,
+                                     (DISP_H - SARIBug.header.h) / 2 + y - globe_renderer::win_y);
 }
 DcsBios::IntegerBuffer saiManPitchAdjBuffer(0x74ea, 0xffff, 0, onSaiManPitchAdjChange);
 
@@ -162,6 +174,25 @@ void onSaiAttWarningFlagChange(unsigned int v) {
   lv_img_set_angle(caged_img, (int16_t)mapInt((uint16_t)v, 0, 65535, -900, 0));
 }
 DcsBios::IntegerBuffer saiAttWarningFlagBuffer(0x74e8, 0xffff, 0, onSaiAttWarningFlagChange);
+
+// ILS needles (drawn by the globe renderer, so they are not shown with the LVGL globe)
+static int needle_ver = -1, needle_hor = -1;
+static inline int ilsOffsetPx(unsigned int v) {
+  return ((int)v - (int)DCS_HALF) * ILS_TRAVEL_PX / (int)DCS_HALF;
+}
+void onSaiPointerVerChange(unsigned int v) {
+  globe_renderer::set_layer_pos(needle_ver,
+                                (globe_renderer::WIN_W - VerticalPointer.header.w) / 2 + ILS_VER_DIR * ilsOffsetPx(v),
+                                (globe_renderer::WIN_H - VerticalPointer.header.h) / 2);
+}
+DcsBios::IntegerBuffer saiPointerVerBuffer(0x756a, 0xffff, 0, onSaiPointerVerChange);
+
+void onSaiPointerHorChange(unsigned int v) {
+  globe_renderer::set_layer_pos(needle_hor,
+                                (globe_renderer::WIN_W - HorizontalPointer.header.w) / 2,
+                                (globe_renderer::WIN_H - HorizontalPointer.header.h) / 2 + ILS_HOR_DIR * ilsOffsetPx(v));
+}
+DcsBios::IntegerBuffer saiPointerHorBuffer(0x756c, 0xffff, 0, onSaiPointerHorChange);
 
 // ────────────────────────────── Display Flush ──────────────────────────────
 #ifndef SARI_PROFILE
@@ -315,6 +346,7 @@ void setup() {
   disp->refr_timer = nullptr;
 
   lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_black(), 0);   // anything the bezel leaves uncovered shows black, not LVGL's near-white
 
   // Globe pitch scale (keep original math)
   const int globe_w = SARIGlobe.header.w;
@@ -332,6 +364,10 @@ void setup() {
   use_globe_renderer = globe_renderer::create(scr, &SARIBackground, &SARIGlobe,
                                               (DISP_W - GLOBE_VP_W) / 2, (DISP_H - GLOBE_VP_H) / 2 + GLOBE_Y_OFFSET,
                                               pivot_x, pivot_y) != nullptr;
+  // Layers are drawn in this order, so the needles pass over the aircraft symbol
+  layer_bug  = globe_renderer::add_layer(&SARIBug, lv_color_black());
+  needle_ver = globe_renderer::add_layer(&VerticalPointer, lv_color_hex(ILS_COLOUR));
+  needle_hor = globe_renderer::add_layer(&HorizontalPointer, lv_color_hex(ILS_COLOUR));
 #endif
   if (!use_globe_renderer) {
     lv_obj_t *holder = lv_obj_create(scr);
@@ -363,7 +399,7 @@ void setup() {
   lv_obj_set_pos(bank_img, (DISP_W - Bank.header.w) / 2, (DISP_H - BANK_FULL_H) / 2 + BANK_Y_OFFSET);
   lv_img_set_pivot(bank_img, Bank.header.w / 2, BANK_FULL_H / 2);
 
-  bug_img  = lv_img_create(scr); lv_img_set_src(bug_img,  &SARIBug);     lv_obj_align(bug_img,  LV_ALIGN_CENTER, 0, BUG_Y_OFFSET);
+  if (layer_bug < 0) { bug_img = lv_img_create(scr); lv_img_set_src(bug_img, &SARIBug); lv_obj_align(bug_img, LV_ALIGN_CENTER, 0, BUG_Y_OFFSET); }
   slip_img = lv_img_create(scr); lv_img_set_src(slip_img, &SlipBall);    lv_obj_align(slip_img, LV_ALIGN_CENTER, 0, SLIP_BASE_Y);
   rot_img  = lv_img_create(scr); lv_img_set_src(rot_img,  &RateOfTurn);  lv_obj_align(rot_img,  LV_ALIGN_CENTER, 0, ROT_BASE_Y);
 
@@ -386,6 +422,8 @@ void setup() {
   onSaiRateOfTurnChange(DCS_MID);
   onSaiManPitchAdjChange(DCS_MID);
   onSaiAttWarningFlagChange(65535);
+  onSaiPointerVerChange(65535);   // out of view until DCS says otherwise
+  onSaiPointerHorChange(65535);
 }
 
 #if SARI_DEMO_MODE
@@ -410,6 +448,9 @@ static void demo_step(uint32_t ms) {
   onSaiManPitchAdjChange((unsigned int)(32768.0f + 32000.0f * sinf(t * 0.3f)));
   // OFF flag: swings across its full travel once every 8 s
   onSaiAttWarningFlagChange((unsigned int)(32768.0f + 32767.0f * sinf(t * 0.785f)));
+  // ILS needles: each slides across its full travel, out of view at both ends
+  onSaiPointerVerChange((unsigned int)(32768.0f + 32767.0f * sinf(t * 0.6f)));
+  onSaiPointerHorChange((unsigned int)(32768.0f + 32767.0f * sinf(t * 0.45f)));
 }
 #endif
 

@@ -26,7 +26,12 @@
 namespace globe_renderer {
 
 constexpr int SCR_W = 480, SCR_H = 480;
-constexpr int WIN_W = 275, WIN_H = 275;   // globe window rectangle (the old LVGL "holder")
+// Globe window rectangle: the old LVGL "holder" (275 x 275) plus a margin on every side. The hole in the bezel
+// image is not centred on the holder (it sits 2 px to one side and 2 px up), so without the margin its last two
+// columns and rows fell outside the rectangle and showed the screen background as a thin light sliver.
+// The margin keeps the centre, and with it the whole picture, where it was.
+constexpr int WIN_MARGIN = 2;
+constexpr int WIN_W = 275 + 2 * WIN_MARGIN, WIN_H = 275 + 2 * WIN_MARGIN;
 
 static lv_obj_t *scene = nullptr;
 static int win_x = 0, win_y = 0;          // top-left of the window rectangle on screen
@@ -63,6 +68,19 @@ static int flat_colours = 0;
 constexpr int COARSE_SHIFT = 4;
 static uint8_t *coarse_map = nullptr;     // coarse_w x coarse_h
 static int coarse_w = 0, coarse_h = 0;
+
+// Layers: images drawn over the globe and under the bezel, in the order they were added (the aircraft symbol, then
+// the ILS needles on top of it). One that is moved out past the edge of the window disappears behind the bezel.
+// Each is an upright image that only ever slides, never turns.
+struct Layer {
+  uint16_t *rgb;                          // w x h colours
+  uint8_t  *a;                            // w x h alpha
+  int w, h;
+  int x, y;                               // top-left in window coordinates
+};
+constexpr int MAX_LAYERS = 3;
+static Layer layers[MAX_LAYERS];
+static int layer_n = 0;
 
 // Attitude for the next draw
 static float att_pitch_px = 0.0f;         // texture rows the globe is shifted by
@@ -202,6 +220,9 @@ static void draw(lv_event_t *e) {
     }
 
     const int ol = open_l[ly], orr = open_r[ly], cl = clear_l[ly], cr = clear_r[ly];
+    uint16_t *const win_dst = dst - lx_first;                  // this row's pixel for window column 0
+    const uint16_t *const win_bz = bz - lx_first;
+    const int32_t u_row = u00 + ly * du_dy, v_row = v00 + ly * dv_dy;
     const uint8_t *al = bezel_a + ly * WIN_W;
     int32_t u = u00 + ly * du_dy + lx_first * du_dx;
     int32_t v = v00 + ly * dv_dy + lx_first * dv_dx;
@@ -243,6 +264,28 @@ static void draw(lv_event_t *e) {
     // 5. opaque bezel on the right, then the bezel beyond the window rectangle
     const int rest = a.x2 - (win_x + lx) + 1;
     if (rest > 0) memcpy(dst, bz, rest * sizeof(uint16_t));
+
+    // 6. layers, over the globe pixels just drawn. In the soft edge the globe is sampled again, so that the
+    //    order stays globe, layer, bezel (a second layer there does not see the first; it is a pixel or two).
+    for (int i = 0; i < layer_n; i++) {
+      const Layer &nd = layers[i];
+      const int ry = ly - nd.y;
+      if (ry < 0 || ry >= nd.h) continue;
+      const int xa = max(max(nd.x, ol), lx_first), xb = min(min(nd.x + nd.w - 1, orr), lx_last);
+      for (int x = xa; x <= xb; x++) {
+        const int k = ry * nd.w + (x - nd.x);
+        const uint32_t na = (nd.a[k] + 4) >> 3;                // layer weight 0..32
+        if (na == 0) continue;
+        if (x >= cl && x <= cr) {
+          win_dst[x] = mix565(win_dst[x], nd.rgb[k], na);
+        } else {
+          const uint32_t w = (al[x] + 4) >> 3;                 // bezel weight
+          if (w >= 32) continue;
+          const uint16_t under = mix565(sample_checked(u_row + x * du_dx, v_row + x * dv_dx), nd.rgb[k], na);
+          win_dst[x] = mix565(under, win_bz[x], w);
+        }
+      }
+    }
   }
   prof_draw_us += micros() - prof_t0;
 }
@@ -334,12 +377,12 @@ static bool prepare_bezel(const lv_img_dsc_t *bezel, lv_color_t screen_colour) {
 }
 
 // Creates the scene object on `parent`. Returns nullptr if it cannot be set up (the caller then uses LVGL images).
-// window_x / window_y: top-left of the globe window rectangle. pivot_x / pivot_y: texel shown at the window centre
+// window_x / window_y: top-left of the globe window rectangle, before the margin is added. pivot_x / pivot_y: texel shown at the window centre
 // at zero pitch.
 static lv_obj_t *create(lv_obj_t *parent, const lv_img_dsc_t *bezel, const lv_img_dsc_t *globe,
                         int window_x, int window_y, int pivot_x, int pivot_y) {
   if (globe->header.cf != LV_IMG_CF_TRUE_COLOR || sizeof(lv_color_t) != 2) return nullptr;
-  win_x = window_x; win_y = window_y;
+  win_x = window_x - WIN_MARGIN; win_y = window_y - WIN_MARGIN;
   tex_w = globe->header.w; tex_h = globe->header.h;
   tex_pivot_x = pivot_x; tex_pivot_y = pivot_y;
 
@@ -368,13 +411,57 @@ static lv_obj_t *create(lv_obj_t *parent, const lv_img_dsc_t *bezel, const lv_im
   return scene;
 }
 
+// Schedules a redraw of the globe window.
+static void invalidate_window() {
+  lv_area_t win = { (lv_coord_t)win_x, (lv_coord_t)win_y, (lv_coord_t)(win_x + WIN_W - 1), (lv_coord_t)(win_y + WIN_H - 1) };
+  lv_obj_invalidate_area(scene, &win);
+}
+
+// Adds a layer from a TRUE_COLOR_ALPHA or INDEXED_8BIT image (its own colours) or an ALPHA_8BIT image (drawn in
+// `colour`). It starts out of view. Returns its number for set_layer_pos, or -1 if it cannot be set up.
+static int add_layer(const lv_img_dsc_t *img, lv_color_t colour) {
+  if (!scene || layer_n == MAX_LAYERS) return -1;
+  const lv_img_cf_t cf = img->header.cf;
+  const bool indexed = cf == LV_IMG_CF_INDEXED_8BIT;
+  if (!indexed && cf != LV_IMG_CF_ALPHA_8BIT && cf != LV_IMG_CF_TRUE_COLOR_ALPHA) return -1;
+  Layer &nd = layers[layer_n];
+  nd.w = img->header.w; nd.h = img->header.h;
+  const int px = nd.w * nd.h;
+  nd.rgb = (uint16_t *)heap_caps_malloc(px * sizeof(uint16_t), MALLOC_CAP_INTERNAL);
+  nd.a   = (uint8_t *)heap_caps_malloc(px, MALLOC_CAP_INTERNAL);
+  if (!nd.rgb || !nd.a) { free(nd.rgb); free(nd.a); return -1; }
+  const uint8_t *pal = img->data, *data = indexed ? img->data + 256 * 4 : img->data;
+  for (int i = 0; i < px; i++) {
+    if (indexed) {
+      const uint8_t *p = pal + data[i] * 4;                    // B, G, R, A
+      nd.rgb[i] = (uint16_t)(((p[2] >> 3) << 11) | ((p[1] >> 2) << 5) | (p[0] >> 3));
+      nd.a[i] = p[3];
+    } else if (cf == LV_IMG_CF_TRUE_COLOR_ALPHA) {
+      const uint8_t *p = data + i * 3;                         // two colour bytes, then alpha
+      nd.rgb[i] = LV_COLOR_16_SWAP ? (uint16_t)((p[0] << 8) | p[1]) : (uint16_t)(p[0] | (p[1] << 8));
+      nd.a[i] = p[2];
+    } else {
+      nd.rgb[i] = lv_color_to16(colour);
+      nd.a[i] = data[i];
+    }
+  }
+  nd.x = WIN_W; nd.y = WIN_H;
+  return layer_n++;
+}
+
+// Moves a layer. x, y: top-left of its image in window coordinates.
+static void set_layer_pos(int layer, int x, int y) {
+  if (layer < 0 || layer >= layer_n || (layers[layer].x == x && layers[layer].y == y)) return;
+  layers[layer].x = x; layers[layer].y = y;
+  invalidate_window();
+}
+
 // Sets the attitude and schedules a redraw of the window if it changed.
 static void set_attitude(float pitch_px, float bank_rad) {
   if (!scene || (pitch_px == att_pitch_px && bank_rad == att_bank_rad)) return;
   att_pitch_px = pitch_px;
   att_bank_rad = bank_rad;
-  lv_area_t win = { (lv_coord_t)win_x, (lv_coord_t)win_y, (lv_coord_t)(win_x + WIN_W - 1), (lv_coord_t)(win_y + WIN_H - 1) };
-  lv_obj_invalidate_area(scene, &win);
+  invalidate_window();
 }
 
 }  // namespace globe_renderer
