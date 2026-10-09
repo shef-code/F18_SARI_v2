@@ -3,6 +3,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
@@ -21,7 +22,7 @@
 #define LCD_CLK_PIN   2
 #define LCD_MOSI_PIN  1 
 #define LCD_Backlight_PIN   6 
-// Backlight   ledChannel：PWM Channe 
+// Backlight   ledChannel???PWM Channe 
 #define PWM_Channel     1       // PWM Channel   
 #define Frequency       20000   // PWM frequencyconst        
 #define Resolution      10       // PWM resolution ratio     MAX:13
@@ -32,7 +33,7 @@ extern uint8_t LCD_Backlight;
 
 #define ESP_PANEL_LCD_WIDTH                       (480)
 #define ESP_PANEL_LCD_HEIGHT                      (480)
-#define ESP_PANEL_LCD_RGB_TIMING_FREQ_HZ          (30 * 1000 * 1000)
+#define ESP_PANEL_LCD_RGB_TIMING_FREQ_HZ          (16 * 1000 * 1000)
 #define ESP_PANEL_LCD_RGB_TIMING_HPW              (8)
 #define ESP_PANEL_LCD_RGB_TIMING_HBP              (10)
 #define ESP_PANEL_LCD_RGB_TIMING_HFP              (50)
@@ -42,7 +43,7 @@ extern uint8_t LCD_Backlight;
 #define ESP_PANEL_LCD_RGB_PCLK_ACTIVE_NEG         (0)     // 0: rising edge, 1: falling edge
 #define ESP_PANEL_LCD_RGB_DATA_WIDTH              (16)
 #define ESP_PANEL_LCD_RGB_PIXEL_BITS              (16)    // 24 | 16
-#define ESP_PANEL_LCD_RGB_FRAME_BUF_NUM           (1)     // 1/2/3
+#define ESP_PANEL_LCD_RGB_FRAME_BUF_NUM           (2)     // 1/2/3. Two: LVGL draws into the hidden one, then they swap (no tearing)
 #define ESP_PANEL_LCD_RGB_BOUNCE_BUF_SIZE         (10 * ESP_PANEL_LCD_HEIGHT)     // Bounce buffer size in bytes. This function is used to avoid screen drift.
                                                           // To enable the bounce buffer, set it to a non-zero value. Typically set to `ESP_PANEL_LCD_WIDTH * 10`
                                                           // The size of the Bounce Buffer must satisfy `width_of_lcd * height_of_lcd = size_of_buffer * N`,
@@ -80,10 +81,11 @@ extern uint8_t LCD_Backlight;
 
 
 extern esp_lcd_panel_handle_t panel_handle;   
-bool example_on_vsync_event(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *event_data, void *user_data);
 void ST7701_Init();
 
 void LCD_Init();
+void LCD_getFrameBuffers(void **fb0, void **fb1);
+void LCD_showFrameBuffer(void *fb);
 void LCD_addWindow(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yend,uint8_t* color);
 
 // backlight

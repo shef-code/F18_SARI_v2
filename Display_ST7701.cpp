@@ -1,7 +1,9 @@
 #include "Display_ST7701.h"  
       
 spi_device_handle_t SPI_handle = NULL;     
-esp_lcd_panel_handle_t panel_handle = NULL;            
+esp_lcd_panel_handle_t panel_handle = NULL;
+static SemaphoreHandle_t frame_done_sem = NULL;
+static bool on_frame_buf_complete(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *event_data, void *user_data);
 void ST7701_WriteCommand(uint8_t cmd)
 {
   spi_transaction_t spi_tran = {
@@ -372,19 +374,34 @@ void ST7701_Init()
       .fb_in_psram = true,                                                                        // 如果启用此标志，帧缓冲区将优先从PSRAM分配
     },
   };
-  esp_lcd_new_rgb_panel(&rgb_config, &panel_handle); 
-  // esp_lcd_rgb_panel_event_callbacks_t cbs = {
-  //   .on_vsync = example_on_vsync_event,
-  // };
-  // esp_lcd_rgb_panel_register_event_callbacks(panel_handle, &cbs, &disp_drv);
+  esp_lcd_new_rgb_panel(&rgb_config, &panel_handle);
+  frame_done_sem = xSemaphoreCreateBinary();
+  esp_lcd_rgb_panel_event_callbacks_t cbs = {};
+  cbs.on_frame_buf_complete = on_frame_buf_complete;
+  esp_lcd_rgb_panel_register_event_callbacks(panel_handle, &cbs, NULL);
   esp_lcd_panel_reset(panel_handle);
   esp_lcd_panel_init(panel_handle);
 }
 
-bool example_on_vsync_event(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *event_data, void *user_data)
+// Called from the panel interrupt each time a whole frame buffer has been sent to the LCD.
+static bool on_frame_buf_complete(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *event_data, void *user_data)
 {
   BaseType_t high_task_awoken = pdFALSE;
+  xSemaphoreGiveFromISR(frame_done_sem, &high_task_awoken);
   return high_task_awoken == pdTRUE;
+}
+
+void LCD_getFrameBuffers(void **fb0, void **fb1) {
+  esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 2, fb0, fb1);
+}
+
+// Shows the given frame buffer (one of the two from LCD_getFrameBuffers). The panel switches to it at the start
+// of its next refresh, so a half-drawn frame is never displayed. Returns once the previously shown buffer is no
+// longer being read by the panel and is safe to draw into.
+void LCD_showFrameBuffer(void *fb) {
+  xSemaphoreTake(frame_done_sem, 0);                                    // discard a stale signal
+  esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, ESP_PANEL_LCD_WIDTH, ESP_PANEL_LCD_HEIGHT, fb);
+  xSemaphoreTake(frame_done_sem, pdMS_TO_TICKS(50));                    // timeout so a missed signal cannot hang the gauge
 }
 void LCD_Init() {
   ST7701_Reset();

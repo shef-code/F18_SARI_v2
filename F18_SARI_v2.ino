@@ -4,6 +4,15 @@
 #define DCSBIOS_DEFAULT_SERIAL
 #define DCSBIOS_DISABLE_SERVO
 
+// Bench demo: drive the gauge with synthetic data instead of DCS-BIOS (for testing and FPS measurement).
+//   0 = off (normal operation, reads DCS-BIOS)
+//   1 = pitch sweep + continuous roll
+//   2 = pitch sweep only
+//   3 = continuous roll only
+// Slip ball, rate of turn, pitch-adjust bug and the OFF flag animate in every demo mode.
+// For FPS numbers also set SARI_PERF_MONITOR to 1 in lv_conf.h.
+#define SARI_DEMO_MODE 0
+
 #include <Arduino.h>
 #include <DcsBios.h>
 #include <lvgl.h>
@@ -163,9 +172,95 @@ void onSaiAttWarningFlagChange(unsigned int v) {
 DcsBios::IntegerBuffer saiAttWarningFlagBuffer(0x74e8, 0xffff, 0, onSaiAttWarningFlagChange);
 
 // ────────────────────────────── Display Flush ──────────────────────────────
+#ifndef SARI_PROFILE
+#define SARI_PROFILE 0   // 1 = print render/flush timing to Serial every 2 s (demo mode only: Serial is the DCS-BIOS port)
+#endif
+#if SARI_PROFILE
+static uint32_t prof_flush_us = 0, prof_flush_px = 0, prof_flush_n = 0;
+static uint32_t prof_copy_us = 0, prof_show_us = 0, prof_sync_us = 0;
+#endif
+// The panel has two frame buffers: the one on screen and a hidden one. LVGL renders into its own buffer in fast
+// internal RAM, and this copies each finished piece into the hidden frame buffer. After the last piece of a frame
+// the two are swapped at the panel's next refresh, so nothing half-drawn reaches the screen.
+// The buffer that is now hidden still holds the frame before, so the areas just drawn are stale in it. They are
+// remembered here and refresh_display() has LVGL redraw them on the next frame (copying them across from the
+// other frame buffer was measured at about 44 ms per frame, because it reads and writes PSRAM at once).
+static lv_color_t *fb_front = nullptr, *fb_back = nullptr;
+constexpr int MAX_FRAME_AREAS = 12;
+static lv_area_t frame_areas[MAX_FRAME_AREAS];   // areas drawn into fb_back during the current frame
+static int frame_area_cnt = 0;
+static lv_area_t stale_areas[MAX_FRAME_AREAS];   // areas of the frame just shown, missing from the hidden buffer
+static int stale_area_cnt = 0;
+static bool frame_shown = false;
+
 static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *buf) {
-  LCD_addWindow(area->x1, area->y1, area->x2, area->y2, (uint8_t*)buf);
+#if SARI_PROFILE
+  const uint32_t t0 = micros();
+#endif
+  const int w = lv_area_get_width(area);
+  lv_color_t *dst = fb_back + area->y1 * DISP_W + area->x1;
+  for (int y = area->y1; y <= area->y2; y++) {
+    memcpy(dst, buf, w * sizeof(lv_color_t));
+    dst += DISP_W;
+    buf += w;
+  }
+#if SARI_PROFILE
+  prof_copy_us += micros() - t0;
+#endif
+  if (frame_area_cnt < MAX_FRAME_AREAS) frame_areas[frame_area_cnt++] = *area;
+  else _lv_area_join(&frame_areas[MAX_FRAME_AREAS - 1], &frame_areas[MAX_FRAME_AREAS - 1], area);
+
+  if (lv_disp_flush_is_last(drv)) {
+#if SARI_PROFILE
+    const uint32_t t1 = micros();
+#endif
+    LCD_showFrameBuffer(fb_back);
+#if SARI_PROFILE
+    prof_show_us += micros() - t1;
+#endif
+    lv_color_t *shown = fb_back;
+    fb_back = fb_front;
+    fb_front = shown;
+    frame_shown = true;
+  }
+#if SARI_PROFILE
+  prof_flush_us += micros() - t0;
+  prof_flush_px += (uint32_t)lv_area_get_width(area) * lv_area_get_height(area);
+  prof_flush_n++;
+#endif
   lv_disp_flush_ready(drv);
+}
+
+// Runs one LVGL screen refresh. The sketch drives this itself (LVGL's own refresh timer is removed in setup)
+// so that the stale areas of the hidden frame buffer can be added to the redraw list first.
+static void refresh_display() {
+  lv_disp_t *disp = lv_disp_get_default();
+  if (disp->inv_p == 0) return;                    // nothing changed, leave both frame buffers alone
+
+  // Bring the hidden buffer up to date with what the last frame drew into the other one
+#if SARI_PROFILE
+  const uint32_t t0 = micros();
+#endif
+  for (int i = 0; i < stale_area_cnt; i++) {
+    const lv_area_t *a = &stale_areas[i];
+    const int w = lv_area_get_width(a);
+    for (int y = a->y1; y <= a->y2; y++) {
+      memcpy(fb_back + y * DISP_W + a->x1, fb_front + y * DISP_W + a->x1, w * sizeof(lv_color_t));
+    }
+  }
+#if SARI_PROFILE
+  prof_sync_us += micros() - t0;
+#endif
+  stale_area_cnt = 0;
+  frame_area_cnt = 0;
+  frame_shown = false;
+
+  _lv_disp_refr_timer(nullptr);
+
+  if (frame_shown) {
+    memcpy(stale_areas, frame_areas, sizeof(lv_area_t) * frame_area_cnt);
+    stale_area_cnt = frame_area_cnt;
+  }
 }
 
 // ────────────────────────────── Setup ──────────────────────────────
@@ -182,6 +277,11 @@ void setup() {
 
   lv_init();
 
+  void *fb0 = nullptr, *fb1 = nullptr;
+  LCD_getFrameBuffers(&fb0, &fb1);
+  fb_front = (lv_color_t *)fb0;   // the panel starts by showing its first frame buffer
+  fb_back  = (lv_color_t *)fb1;
+
   static lv_color_t buf[DISP_W * 192];
   static lv_disp_draw_buf_t draw_buf;
   lv_disp_draw_buf_init(&draw_buf, buf, nullptr, DISP_W * 192);
@@ -193,7 +293,10 @@ void setup() {
   disp_drv.draw_buf = &draw_buf;
   disp_drv.flush_cb = my_disp_flush;
   disp_drv.rotated = LV_DISP_ROT_180;
-  lv_disp_drv_register(&disp_drv);
+  lv_disp_t *disp = lv_disp_drv_register(&disp_drv);
+  // The sketch runs the screen refresh itself, see refresh_display()
+  lv_timer_del(disp->refr_timer);
+  disp->refr_timer = nullptr;
 
   lv_obj_t *scr = lv_scr_act();
 
@@ -242,7 +345,9 @@ void setup() {
   lv_img_set_pivot(caged_img, SARICaged.header.w, SARICaged.header.h);
   lv_img_set_angle(caged_img, 900);
 
+#if !SARI_DEMO_MODE
   DcsBios::setup();
+#endif
 
   // Force neutral position (keep)
   onSaiPitchChange(DCS_MID);
@@ -253,12 +358,66 @@ void setup() {
   onSaiAttWarningFlagChange(65535);
 }
 
-void loop() {
-  static uint32_t last_ms = 0;
-  const uint32_t ms = millis();
-  lv_tick_inc(ms - last_ms);
-  last_ms = ms;
+#if SARI_DEMO_MODE
+// Feeds the callbacks at ~30 Hz, the rate DCS-BIOS sends, so the load matches real use.
+static void demo_step(uint32_t ms) {
+  static uint32_t last_demo_ms = 0;
+  if (ms - last_demo_ms < 33) return;
+  last_demo_ms = ms;
 
+  const float t = ms / 1000.0f;
+
+#if SARI_DEMO_MODE != 3
+  // pitch: full sweep in about 25 s
+  onSaiPitchChange((unsigned int)(32768.0f + 32000.0f * sinf(t * 0.25f)));
+#endif
+#if SARI_DEMO_MODE != 2
+  // bank: one full revolution every 12 s
+  onSaiBankChange((unsigned int)(fmodf(t / 12.0f, 1.0f) * 65535.0f));
+#endif
+  onSaiSlipBallChange((unsigned int)(32768.0f + 32000.0f * sinf(t * 0.7f)));
+  onSaiRateOfTurnChange((unsigned int)(32768.0f + 32000.0f * sinf(t * 0.5f)));
+  onSaiManPitchAdjChange((unsigned int)(32768.0f + 32000.0f * sinf(t * 0.3f)));
+  // OFF flag: swings across its full travel once every 8 s
+  onSaiAttWarningFlagChange((unsigned int)(32768.0f + 32767.0f * sinf(t * 0.785f)));
+}
+#endif
+
+// Runs LVGL's timers (animations) and, at LVGL's refresh period, one screen refresh.
+static void run_lvgl() {
+  static uint32_t last_refresh_ms = 0;
   lv_timer_handler();
+  const uint32_t now = millis();
+  if (now - last_refresh_ms >= LV_DISP_DEF_REFR_PERIOD) {
+    last_refresh_ms = now;
+    refresh_display();
+  }
+}
+
+void loop() {
+  // LVGL reads millis() itself (LV_TICK_CUSTOM in lv_conf.h), so its tick keeps running during a draw.
+#if SARI_DEMO_MODE
+  demo_step(millis());
+#endif
+
+#if SARI_PROFILE
+  static uint32_t p_last = 0, p_lvgl_us = 0, p_frames = 0;
+  const uint32_t h0 = micros();
+  run_lvgl();
+  p_lvgl_us += micros() - h0;
+  if (frame_shown) { p_frames++; frame_shown = false; }
+  if (millis() - p_last >= 2000) {
+    Serial.printf("PROF frames=%lu, lvgl=%lu us, flush=%lu us (copy=%lu, swap=%lu), sync=%lu us, %lu flushes, %lu px\n",
+                  (unsigned long)p_frames, (unsigned long)p_lvgl_us, (unsigned long)prof_flush_us,
+                  (unsigned long)prof_copy_us, (unsigned long)prof_show_us, (unsigned long)prof_sync_us,
+                  (unsigned long)prof_flush_n, (unsigned long)prof_flush_px);
+    p_last = millis(); p_lvgl_us = p_frames = 0;
+    prof_flush_us = prof_flush_px = prof_flush_n = prof_copy_us = prof_show_us = prof_sync_us = 0;
+  }
+#else
+  run_lvgl();
+#endif
+#if !SARI_DEMO_MODE
   DcsBios::loop();
+#endif
 }

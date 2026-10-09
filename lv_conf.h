@@ -85,7 +85,7 @@
 
 /*Use a custom tick source that tells the elapsed time in milliseconds.
  *It removes the need to manually update the tick with `lv_tick_inc()`)*/
-#define LV_TICK_CUSTOM 0
+#define LV_TICK_CUSTOM 1
 #if LV_TICK_CUSTOM
     #define LV_TICK_CUSTOM_INCLUDE "Arduino.h"         /*Header for the system time function*/
     #define LV_TICK_CUSTOM_SYS_TIME_EXPR (millis())    /*Expression evaluating to current system time in ms*/
@@ -279,9 +279,12 @@
  *-----------*/
 
 /*1: Show CPU usage and FPS count*/
-#define LV_USE_PERF_MONITOR 0
+/*SARI: set to 1 to show FPS/CPU for benchmarking (shown bottom-centre; the corners of the round panel are not visible).
+ *Must be set here, not in the .ino: the LVGL library is compiled separately and only sees this file.*/
+#define SARI_PERF_MONITOR 0
+#define LV_USE_PERF_MONITOR SARI_PERF_MONITOR
 #if LV_USE_PERF_MONITOR
-    #define LV_USE_PERF_MONITOR_POS LV_ALIGN_BOTTOM_RIGHT
+    #define LV_USE_PERF_MONITOR_POS LV_ALIGN_BOTTOM_MID
 #endif
 
 /*1: Show the used memory and the memory fragmentation
