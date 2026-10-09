@@ -17,6 +17,12 @@
 #include <lvgl.h>
 #include <math.h>
 
+// The sketch is built with -Os, which leaves the small per-pixel helpers below as real function calls (measured at
+// about 1 microsecond per textured pixel). This file is built for speed instead, and the helpers are forced inline.
+#pragma GCC push_options
+#pragma GCC optimize("O2")
+#define GLOBE_INLINE static inline __attribute__((always_inline))
+
 namespace globe_renderer {
 
 constexpr int SCR_W = 480, SCR_H = 480;
@@ -50,6 +56,13 @@ constexpr uint8_t FLAT_NONE = 255;
 static uint8_t *flat_map = nullptr;       // flat_w x flat_h, index into flat_colour or FLAT_NONE
 static int flat_w = 0, flat_h = 0;
 static uint16_t flat_colour[FLAT_NONE];
+static int flat_colours = 0;
+
+// The same map again with 16x16 blocks. A pixel that lands in a flat block here lets the renderer fill every
+// following pixel of the scanline that is still in the block, up to 16 at a time, with one lookup.
+constexpr int COARSE_SHIFT = 4;
+static uint8_t *coarse_map = nullptr;     // coarse_w x coarse_h
+static int coarse_w = 0, coarse_h = 0;
 
 // Attitude for the next draw
 static float att_pitch_px = 0.0f;         // texture rows the globe is shifted by
@@ -58,7 +71,7 @@ static float att_bank_rad = 0.0f;
 static uint32_t prof_draw_us = 0;         // time spent in draw(), for SARI_PROFILE
 
 // Blend two RGB565 colours. w is the weight of b, 0..32.
-static inline uint16_t mix565(uint32_t a, uint32_t b, uint32_t w) {
+GLOBE_INLINE uint16_t mix565(uint32_t a, uint32_t b, uint32_t w) {
   a = (a | (a << 16)) & 0x07E0F81F;
   b = (b | (b << 16)) & 0x07E0F81F;
   const uint32_t r = (a + (((b - a) * w) >> 5)) & 0x07E0F81F;
@@ -67,7 +80,7 @@ static inline uint16_t mix565(uint32_t a, uint32_t b, uint32_t w) {
 
 // Texel fetch that is safe for any coordinate. Past the top or bottom of the texture the view has gone over
 // the pole, so the texture is mirrored (and flipped left to right).
-static inline uint16_t texel(int u, int v) {
+GLOBE_INLINE uint16_t texel(int u, int v) {
   if (v < 0)           { v = -1 - v;            u = tex_w - 1 - u; }
   else if (v >= tex_h) { v = 2 * tex_h - 1 - v; u = tex_w - 1 - u; }
   if (v < 0) v = 0; else if (v >= tex_h) v = tex_h - 1;
@@ -76,7 +89,7 @@ static inline uint16_t texel(int u, int v) {
 }
 
 // Bilinear sample at a 16.16 fixed-point texture coordinate, any coordinate.
-static inline uint16_t sample_checked(int32_t u, int32_t v) {
+GLOBE_INLINE uint16_t sample_checked(int32_t u, int32_t v) {
   const int ui = u >> 16, vi = v >> 16;
   {
     // Flat-colour shortcut, on the mirrored and clamped position of the base texel
@@ -94,19 +107,45 @@ static inline uint16_t sample_checked(int32_t u, int32_t v) {
   return mix565(mix565(c00, c01, fu), mix565(c10, c11, fu), fv);
 }
 
-// Same, for coordinates known to be at least one texel inside the texture on every side.
-static inline uint16_t sample_inside(int32_t u, int32_t v) {
-  const int ui = u >> 16, vi = v >> 16;
-  const uint8_t k = flat_map[(vi >> FLAT_SHIFT) * flat_w + (ui >> FLAT_SHIFT)];
-  if (k != FLAT_NONE) return flat_colour[k];                // flat sky or ground: no texture read at all
-  const uint16_t *p = tex + vi * tex_w + ui;
+// Bilinear sample straight from the texture, for coordinates known to be at least one texel inside it on
+// every side.
+GLOBE_INLINE uint16_t sample_inside(int32_t u, int32_t v) {
+  const uint16_t *p = tex + (v >> 16) * tex_w + (u >> 16);
   const uint16_t c00 = p[0], c01 = p[1], c10 = p[tex_w], c11 = p[tex_w + 1];
   if (c00 == c01 && c00 == c10 && c00 == c11) return c00;
   const uint32_t fu = (u >> 11) & 31, fv = (v >> 11) & 31;
   return mix565(mix565(c00, c01, fu), mix565(c10, c11, fu), fv);
 }
 
-static inline bool inside_texture(int32_t u, int32_t v) {
+// Draws n pixels of one scanline whose texture coordinates all lie inside the texture (see sample_inside).
+// The coordinate moves at most one texel per pixel along each axis, so a pixel that is `d` texels away from the
+// edge of its block, in the direction of travel, is followed by at least `d` more pixels in the same block.
+// In a flat block that whole run is one colour and is filled without looking anything else up.
+GLOBE_INLINE void draw_inside_run(uint16_t *dst, int n, int32_t u, int32_t v, int32_t du, int32_t dv) {
+  int i = 0;
+  while (i < n) {
+    const int ui = u >> 16, vi = v >> 16;
+    int mask = (1 << COARSE_SHIFT) - 1;
+    uint8_t k = coarse_map[(vi >> COARSE_SHIFT) * coarse_w + (ui >> COARSE_SHIFT)];
+    if (k == FLAT_NONE) {
+      mask = (1 << FLAT_SHIFT) - 1;
+      k = flat_map[(vi >> FLAT_SHIFT) * flat_w + (ui >> FLAT_SHIFT)];
+      if (k == FLAT_NONE) {
+        dst[i++] = sample_inside(u, v);
+        u += du; v += dv;
+        continue;
+      }
+    }
+    int run = n - i;
+    if (du > 0) run = min(run, mask - (ui & mask) + 1); else if (du < 0) run = min(run, (ui & mask) + 1);
+    if (dv > 0) run = min(run, mask - (vi & mask) + 1); else if (dv < 0) run = min(run, (vi & mask) + 1);
+    const uint16_t colour = flat_colour[k];
+    for (const int end = i + run; i < end; i++) dst[i] = colour;
+    u += run * du; v += run * dv;
+  }
+}
+
+GLOBE_INLINE bool inside_texture(int32_t u, int32_t v) {
   const int ui = u >> 16, vi = v >> 16;
   return ui >= 0 && ui < tex_w - 1 && vi >= 0 && vi < tex_h - 1;
 }
@@ -188,11 +227,12 @@ static void draw(lv_event_t *e) {
       const int32_t u_end = u + (n - 1) * du_dx, v_end = v + (n - 1) * dv_dx;
       if (inside_texture(u, v) && inside_texture(u_end, v_end)) {
         // The coordinate moves in a straight line, so if both ends are inside the texture the whole run is.
-        for (int i = 0; i < n; i++, u += du_dx, v += dv_dx) dst[i] = sample_inside(u, v);
+        draw_inside_run(dst, n, u, v, du_dx, dv_dx);
       } else {
-        for (int i = 0; i < n; i++, u += du_dx, v += dv_dx) dst[i] = sample_checked(u, v);
+        int32_t uu = u, vv = v;
+        for (int i = 0; i < n; i++, uu += du_dx, vv += dv_dx) dst[i] = sample_checked(uu, vv);
       }
-      dst += n; bz += n; lx += n;
+      dst += n; bz += n; lx += n; u += n * du_dx; v += n * dv_dx;
     }
     // 4. soft edge on the right
     end = min(orr, lx_last);
@@ -207,20 +247,21 @@ static void draw(lv_event_t *e) {
   prof_draw_us += micros() - prof_t0;
 }
 
-// Builds flat_map from the texture.
-static bool prepare_flat_map() {
-  flat_w = (tex_w + (1 << FLAT_SHIFT) - 1) >> FLAT_SHIFT;
-  flat_h = (tex_h + (1 << FLAT_SHIFT) - 1) >> FLAT_SHIFT;
-  flat_map = (uint8_t *)heap_caps_malloc(flat_w * flat_h, MALLOC_CAP_INTERNAL);
-  if (!flat_map) flat_map = (uint8_t *)heap_caps_malloc(flat_w * flat_h, MALLOC_CAP_SPIRAM);
-  if (!flat_map) return false;
-  int colours = 0;
-  for (int by = 0; by < flat_h; by++) {
-    for (int bx = 0; bx < flat_w; bx++) {
-      const int x0 = bx << FLAT_SHIFT, y0 = by << FLAT_SHIFT;
+// Builds a flat-colour map of the texture with blocks of (1 << shift) texels a side. Returns nullptr if there is
+// no memory for it.
+static uint8_t *build_flat_map(int shift, int &map_w, int &map_h) {
+  map_w = (tex_w + (1 << shift) - 1) >> shift;
+  map_h = (tex_h + (1 << shift) - 1) >> shift;
+  uint8_t *map = (uint8_t *)heap_caps_malloc(map_w * map_h, MALLOC_CAP_INTERNAL);
+  if (!map) map = (uint8_t *)heap_caps_malloc(map_w * map_h, MALLOC_CAP_SPIRAM);
+  if (!map) return nullptr;
+  int &colours = flat_colours;
+  for (int by = 0; by < map_h; by++) {
+    for (int bx = 0; bx < map_w; bx++) {
+      const int x0 = bx << shift, y0 = by << shift;
       // one texel of border on every side, so the neighbours a bilinear sample reads are covered in any direction
       const int xa = max(x0 - 1, 0), ya = max(y0 - 1, 0);
-      const int x1 = min(x0 + (1 << FLAT_SHIFT), tex_w - 1), y1 = min(y0 + (1 << FLAT_SHIFT), tex_h - 1);
+      const int x1 = min(x0 + (1 << shift), tex_w - 1), y1 = min(y0 + (1 << shift), tex_h - 1);
       const uint16_t c = tex[y0 * tex_w + x0];
       bool flat = true;
       for (int y = ya; y <= y1 && flat; y++)
@@ -233,10 +274,16 @@ static bool prepare_flat_map() {
         if (i == colours && colours < FLAT_NONE) flat_colour[colours++] = c;
         if (i < colours) k = (uint8_t)i;
       }
-      flat_map[by * flat_w + bx] = k;
+      map[by * map_w + bx] = k;
     }
   }
-  return true;
+  return map;
+}
+
+static bool prepare_flat_maps() {
+  flat_map   = build_flat_map(FLAT_SHIFT, flat_w, flat_h);
+  coarse_map = build_flat_map(COARSE_SHIFT, coarse_w, coarse_h);
+  return flat_map && coarse_map;
 }
 
 // Builds the bezel tables from the INDEXED_8BIT bezel image (256-entry B,G,R,A palette, then one byte per pixel).
@@ -308,7 +355,7 @@ static lv_obj_t *create(lv_obj_t *parent, const lv_img_dsc_t *bezel, const lv_im
     return nullptr;
   }
 
-  if (!prepare_flat_map()) return nullptr;
+  if (!prepare_flat_maps()) return nullptr;
   if (!prepare_bezel(bezel, lv_obj_get_style_bg_color(parent, LV_PART_MAIN))) return nullptr;
 
   scene = lv_obj_create(parent);
@@ -331,3 +378,6 @@ static void set_attitude(float pitch_px, float bank_rad) {
 }
 
 }  // namespace globe_renderer
+
+#undef GLOBE_INLINE
+#pragma GCC pop_options
