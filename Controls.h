@@ -26,9 +26,13 @@ constexpr int STEPS_PER_DETENT = 4;
 // Swap to reverse a knob that turns the wrong way.
 constexpr bool ENC1_REVERSE = false;
 constexpr bool ENC2_REVERSE = false;
-// Each click moves the DCS-BIOS control by this much (the suggested step; the full range is 65535).
-constexpr const char *STEP_UP = "+3200";
-constexpr const char *STEP_DOWN = "-3200";
+// Each click moves the DCS-BIOS control by this much (the full range is 65535).
+// SARI adjust knob: one degree of symbol travel, 6 px per degree against 70 px for 32768 counts = 2809 counts.
+constexpr const char *SARI_STEP_UP = "+2809";
+constexpr const char *SARI_STEP_DOWN = "-2809";
+// Barometer knob: the DCS-BIOS suggested step.
+constexpr const char *BARO_STEP_UP = "+3200";
+constexpr const char *BARO_STEP_DOWN = "-3200";
 
 constexpr uint8_t DEBOUNCE_POLLS = 5;        // a switch must read the same this many polls in a row
 
@@ -117,10 +121,10 @@ inline void begin() {
   xTaskCreatePinnedToCore(pollTask, "controls", 3072, nullptr, 1, nullptr, other);
 }
 
-inline void sendClicks(Knob &k, const char *control) {
+inline void sendClicks(Knob &k, const char *control, const char *up, const char *down) {
   int n = k.clicks.load();
   while (n != 0) {
-    if (!DcsBios::tryToSendDcsBiosMessage(control, n > 0 ? STEP_UP : STEP_DOWN)) return;   // retry next loop
+    if (!DcsBios::tryToSendDcsBiosMessage(control, n > 0 ? up : down)) return;   // retry next loop
     if (n > 0) { k.clicks.fetch_sub(1); n--; } else { k.clicks.fetch_add(1); n++; }
   }
 }
@@ -133,8 +137,8 @@ inline void sendSwitch(Switch &s, bool &last, const char *control) {
 // Call from loop().
 inline void service() {
   if (!present) return;
-  sendClicks(enc1, "SAI_SET");
-  sendClicks(enc2, "STBY_PRESS_ALT");
+  sendClicks(enc1, "SAI_SET", SARI_STEP_UP, SARI_STEP_DOWN);
+  sendClicks(enc2, "STBY_PRESS_ALT", BARO_STEP_UP, BARO_STEP_DOWN);
   sendSwitch(cage, lastCage, "SAI_CAGE");
   sendSwitch(test, lastTest, "SAI_TEST_BTN");
 }

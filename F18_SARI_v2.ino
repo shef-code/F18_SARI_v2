@@ -523,7 +523,7 @@ constexpr int DEMO_VARIANT = SARI_DEMO_MODE;
 #else
 constexpr int DEMO_VARIANT = 1;
 #endif
-constexpr int ADJ_STEP = 3200;              // per click of the adjust knob, as it is sent to DCS
+constexpr int ADJ_STEP = 2809;              // per click of the adjust knob, as it is sent to DCS
 // Turning the knob clockwise moves the symbol this way while DCS is not connected; the minus sign in local_controls() sets it
 
 // Controls while DCS is not connected (the demo included). The adjust knob moves the aircraft symbol, the cage switch
