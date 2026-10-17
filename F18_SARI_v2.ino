@@ -4,12 +4,17 @@
 #define DCSBIOS_DEFAULT_SERIAL
 #define DCSBIOS_DISABLE_SERVO
 
-// Bench demo: drive the gauge with synthetic data instead of DCS-BIOS (for testing and FPS measurement).
-//   0 = off (normal operation, reads DCS-BIOS)
+// While DCS is not connected the gauge shows a normal level display (the last DCS values, once it has had any), and
+// the physical controls work on it: the adjust knob moves the aircraft symbol, the cage switch puts the OFF flag in
+// view while it is pulled, the test button centres the ILS needles while it is held.
+// Demo mode: the gauge drives itself with synthetic data.
+//   0 = normal operation: reads DCS-BIOS, and starts the demo (variant 1) once no DCS-BIOS data has arrived for
+//       DEMO_AFTER_MS (5 minutes, counted from power-up), leaving it again as soon as DCS connects
+// The other values force the demo on for testing and FPS measurement, and never read DCS-BIOS:
 //   1 = pitch sweep + continuous roll
 //   2 = pitch sweep only
 //   3 = continuous roll only
-// Slip ball, rate of turn, pitch-adjust bug and the OFF flag animate in every demo mode.
+// Slip ball, rate of turn, OFF flag and ILS needles animate in every demo mode.
 // For FPS numbers also set SARI_PERF_MONITOR to 1 in lv_conf.h.
 #define SARI_DEMO_MODE 0
 
@@ -24,6 +29,7 @@
 #include "TCA9554PWR.h"
 #include "Display_ST7701.h"
 #include "GlobeRenderer.h"
+#include "Controls.h"
 
 extern "C" {
   extern const lv_img_dsc_t SARIBackground, SARIBug, RateOfTurn, SlipBall;
@@ -65,6 +71,8 @@ constexpr uint32_t ILS_COLOUR     = 0x9A682C;   // horizontal needle; the vertic
 
 constexpr uint16_t DCS_MID  = 32782;
 constexpr uint16_t DCS_HALF = 32768;
+constexpr uint32_t DCS_LIVE_MS = 3000;       // DCS-BIOS bytes within this time = DCS is connected
+constexpr uint32_t DEMO_AFTER_MS = 5UL * 60UL * 1000UL;   // no DCS-BIOS bytes for this long = run the demo
 
 // ────────────────────────────── LVGL Objects ──────────────────────────────
 static lv_obj_t *globe_img = nullptr;   // only when the LVGL globe is in use
@@ -79,6 +87,18 @@ static lv_obj_t *caged_img = nullptr;
 // ────────────────────────────── State ──────────────────────────────
 static int16_t pitch_x10 = 0;
 static int16_t bank_x10  = 0;
+
+// DCS is connected / the gauge is running its demo
+static bool dcs_live = false;
+static bool demo_active = (SARI_DEMO_MODE != 0);
+// True while the sketch itself is driving the callbacks (controls, demo), so they are not taken for DCS data
+static bool in_local = false;
+
+// The last value DCS sent for each input, so the gauge can go back to it when DCS connects. Callbacks run for local
+// values too, so those are not recorded.
+enum LiveIdx { L_PITCH, L_BANK, L_SLIP, L_RATE, L_ADJ, L_FLAG, L_VER, L_HOR, L_COUNT };
+static uint16_t live_val[L_COUNT];
+static inline void note(LiveIdx i, unsigned int v) { if (!in_local) live_val[i] = (uint16_t)v; }
 
 static int pivot_x = 0, pivot_y = 0;
 static int base_globe_x = 0, base_globe_y = 0;
@@ -113,12 +133,14 @@ static inline void update_globe() {
 
 // ────────────────────────────── DCS-BIOS CALLBACKS (unsigned int!) ──────────────────────────────
 void onSaiPitchChange(unsigned int v) {
+  note(L_PITCH, v);
   pitch_x10 = mapInt((uint16_t)v, 0, 65535, -900, 900);
   update_globe();
 }
 DcsBios::IntegerBuffer saiPitchBuffer(0x74e4, 0xffff, 0, onSaiPitchChange);
 
 void onSaiBankChange(unsigned int v) {
+  note(L_BANK, v);
   bank_x10 = mapInt((uint16_t)v, 0, 65535, 0, 3600);
   const int16_t angle = (int16_t)(bank_x10 % 3600); // keep your original behavior
   lv_img_set_angle(bank_img,  angle);
@@ -128,6 +150,7 @@ void onSaiBankChange(unsigned int v) {
 DcsBios::IntegerBuffer saiBankBuffer(0x74e6, 0xffff, 0, onSaiBankChange);
 
 void onSaiSlipBallChange(unsigned int v) {
+  note(L_SLIP, v);
   int delta = (int)v - (int)DCS_MID;
   int x = (DCS_MID != 0) ? (delta * SLIP_MAX_X_PX / (int)DCS_MID) : 0;
 
@@ -143,6 +166,7 @@ void onSaiSlipBallChange(unsigned int v) {
 DcsBios::IntegerBuffer saiSlipBallBuffer(0x74ec, 0xffff, 0, onSaiSlipBallChange);
 
 void onSaiRateOfTurnChange(unsigned int v) {
+  note(L_RATE, v);
   int delta = (int)v - (int)DCS_MID;
   int x = (DCS_MID != 0) ? (delta * ROT_MAX_X_PX / (int)DCS_MID) : 0;
 
@@ -155,6 +179,7 @@ void onSaiRateOfTurnChange(unsigned int v) {
 DcsBios::IntegerBuffer saiRateOfTurnBuffer(0x74ee, 0xffff, 0, onSaiRateOfTurnChange);
 
 void onSaiManPitchAdjChange(unsigned int v) {
+  note(L_ADJ, v);
   int delta = (int)v - (int)DCS_MID;
 
   // Map DCS full deflection to ±70 px
@@ -171,6 +196,7 @@ DcsBios::IntegerBuffer saiManPitchAdjBuffer(0x74ea, 0xffff, 0, onSaiManPitchAdjC
 
 // DCS already sends the flag position as a smooth sweep, so it is applied as it arrives.
 void onSaiAttWarningFlagChange(unsigned int v) {
+  note(L_FLAG, v);
   lv_img_set_angle(caged_img, (int16_t)mapInt((uint16_t)v, 0, 65535, -900, 0));
 }
 DcsBios::IntegerBuffer saiAttWarningFlagBuffer(0x74e8, 0xffff, 0, onSaiAttWarningFlagChange);
@@ -181,6 +207,7 @@ static inline int ilsOffsetPx(unsigned int v) {
   return ((int)v - (int)DCS_HALF) * ILS_TRAVEL_PX / (int)DCS_HALF;
 }
 void onSaiPointerVerChange(unsigned int v) {
+  note(L_VER, v);
   globe_renderer::set_layer_pos(needle_ver,
                                 (globe_renderer::WIN_W - VerticalPointer.header.w) / 2 + ILS_VER_DIR * ilsOffsetPx(v),
                                 (globe_renderer::WIN_H - VerticalPointer.header.h) / 2);
@@ -188,11 +215,54 @@ void onSaiPointerVerChange(unsigned int v) {
 DcsBios::IntegerBuffer saiPointerVerBuffer(0x756a, 0xffff, 0, onSaiPointerVerChange);
 
 void onSaiPointerHorChange(unsigned int v) {
+  note(L_HOR, v);
   globe_renderer::set_layer_pos(needle_hor,
                                 (globe_renderer::WIN_W - HorizontalPointer.header.w) / 2,
                                 (globe_renderer::WIN_H - HorizontalPointer.header.h) / 2 + ILS_HOR_DIR * ilsOffsetPx(v));
 }
 DcsBios::IntegerBuffer saiPointerHorBuffer(0x756c, 0xffff, 0, onSaiPointerHorChange);
+
+// Night and NVG lighting. In NITE and NVG the display is drawn in green (my_disp_flush) and the INST PNL knob sets
+// its brightness through the backlight. NVG is the same green at NVG_BRIGHTNESS of NITE, so it is not too bright
+// through goggles. From what the switch reports in the aircraft its values are DAY 0, NITE 1, NVG 2; anything else
+// is treated as DAY.
+constexpr uint8_t DAY_BACKLIGHT       = 50;
+constexpr uint8_t NIGHT_BACKLIGHT_MAX = 60;    // knob fully on
+constexpr float   NIGHT_MIN_LEVEL     = 0.05f; // knob fully off, as a fraction of the above
+constexpr float   NVG_BRIGHTNESS      = 0.7f;
+constexpr unsigned int LIGHT_MODE_NITE = 1, LIGHT_MODE_NVG = 2;
+static bool night_tint = false, nvg_mode = false;
+static uint16_t inst_pnl_level = 65535;
+
+static void apply_backlight() {
+  if (!night_tint) { Set_Backlight(DAY_BACKLIGHT); return; }
+  float level = NIGHT_BACKLIGHT_MAX * (NIGHT_MIN_LEVEL + (1.0f - NIGHT_MIN_LEVEL) * inst_pnl_level / 65535.0f);
+  if (nvg_mode) level *= NVG_BRIGHTNESS;
+  Set_Backlight((uint8_t)(level + 0.5f));
+}
+
+void onLightModeChange(unsigned int v) {
+  const bool night = (v == LIGHT_MODE_NITE || v == LIGHT_MODE_NVG);
+  nvg_mode = (v == LIGHT_MODE_NVG);
+  apply_backlight();
+  if (night == night_tint) return;
+  night_tint = night;
+  apply_backlight();
+  lv_obj_invalidate(lv_scr_act());              // redraw everything in the new colours
+}
+DcsBios::IntegerBuffer lightModeBuffer(0x74c8, 0x0600, 9, onLightModeChange);
+
+void onInstPnlDimmerChange(unsigned int v) {
+  inst_pnl_level = (uint16_t)v;
+  if (night_tint) apply_backlight();
+}
+DcsBios::IntegerBuffer instPnlDimmerBuffer(0x7546, 0xffff, 0, onInstPnlDimmerChange);
+
+// RGB565 pixel to a green of the same brightness
+static inline uint16_t green_of(uint16_t p) {
+  const uint32_t lum = (((p >> 11) * 154) + (((p >> 5) & 63) * 150) + ((p & 31) * 58)) >> 8;   // 0..62
+  return (uint16_t)(((lum >> 4) << 11) | (lum << 5) | (lum >> 3));
+}
 
 // ────────────────────────────── Display Flush ──────────────────────────────
 #ifndef SARI_PROFILE
@@ -223,10 +293,18 @@ static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
 #endif
   const int w = lv_area_get_width(area);
   lv_color_t *dst = fb_back + area->y1 * DISP_W + area->x1;
-  for (int y = area->y1; y <= area->y2; y++) {
-    memcpy(dst, buf, w * sizeof(lv_color_t));
-    dst += DISP_W;
-    buf += w;
+  if (night_tint) {
+    for (int y = area->y1; y <= area->y2; y++) {
+      for (int x = 0; x < w; x++) dst[x].full = green_of(buf[x].full);
+      dst += DISP_W;
+      buf += w;
+    }
+  } else {
+    for (int y = area->y1; y <= area->y2; y++) {
+      memcpy(dst, buf, w * sizeof(lv_color_t));
+      dst += DISP_W;
+      buf += w;
+    }
   }
 #if SARI_PROFILE
   prof_copy_us += micros() - t0;
@@ -414,6 +492,7 @@ void setup() {
   Serial.setRxBufferSize(4096);
   DcsBios::setup();
 #endif
+  controls::begin();
 
   // Force neutral position (keep)
   onSaiPitchChange(DCS_MID);
@@ -421,12 +500,89 @@ void setup() {
   onSaiSlipBallChange(DCS_MID);
   onSaiRateOfTurnChange(DCS_MID);
   onSaiManPitchAdjChange(DCS_MID);
-  onSaiAttWarningFlagChange(65535);
-  onSaiPointerVerChange(65535);   // out of view until DCS says otherwise
+  onSaiAttWarningFlagChange(0);      // OFF flag out of view
+  onSaiPointerVerChange(0);       // out of view (on the left) until DCS says otherwise
   onSaiPointerHorChange(65535);
 }
 
+// Puts the gauge back to what DCS last sent (or the neutral display, if it never sent anything).
+static void restore_live() {
+  onSaiPitchChange(live_val[L_PITCH]);
+  onSaiBankChange(live_val[L_BANK]);
+  onSaiSlipBallChange(live_val[L_SLIP]);
+  onSaiRateOfTurnChange(live_val[L_RATE]);
+  onSaiManPitchAdjChange(live_val[L_ADJ]);
+  onSaiAttWarningFlagChange(live_val[L_FLAG]);
+  onSaiPointerVerChange(live_val[L_VER]);
+  onSaiPointerHorChange(live_val[L_HOR]);
+}
+
+// Demo variant: 1 = pitch sweep + continuous roll, 2 = pitch sweep only, 3 = continuous roll only
 #if SARI_DEMO_MODE
+constexpr int DEMO_VARIANT = SARI_DEMO_MODE;
+#else
+constexpr int DEMO_VARIANT = 1;
+#endif
+constexpr int ADJ_STEP = 3200;              // per click of the adjust knob, as it is sent to DCS
+// Turning the knob clockwise moves the symbol this way while DCS is not connected; the minus sign in local_controls() sets it
+
+// Controls while DCS is not connected (the demo included). The adjust knob moves the aircraft symbol, the cage switch
+// puts the OFF flag in view while it is pulled, and the test button centres the ILS needles while it is held. The
+// flag and needles glide to their targets, and the demo only sets their targets, so they never jump.
+// Everything else stays as it was shown.
+static uint16_t local_adj = DCS_MID;        // aircraft symbol position
+static bool local_force = true;             // apply the symbol position again
+constexpr float GLIDE_PER_MS = 65535.0f / 500.0f;   // full travel of the flag or a needle in 0.5 s
+
+struct Glide {
+  float cur;
+  int shown;
+  void sync(uint16_t v) { cur = v; shown = v; }
+  // Moves toward target; returns true when the displayed (whole) value changed.
+  bool step(float target, float max_move) {
+    const float d = target - cur;
+    cur = (d > max_move) ? cur + max_move : (d < -max_move) ? cur - max_move : target;
+    const int now = (int)(cur + 0.5f);
+    if (now == shown) return false;
+    shown = now;
+    return true;
+  }
+};
+static Glide g_flag = {0, 0}, g_ver = {0, 0}, g_hor = {65535, 65535};
+static float demo_flag = 0, demo_ver = 0, demo_hor = 65535;   // targets the demo animates
+
+// The glide values follow the last DCS values, so leaving DCS (or the demo) starts from what is on the screen
+static void sync_glide() {
+  g_flag.sync(live_val[L_FLAG]);
+  g_ver.sync(live_val[L_VER]);
+  g_hor.sync(live_val[L_HOR]);
+}
+
+static void local_controls(uint32_t ms) {
+  static uint32_t last_ms = 0;
+  uint32_t dt = ms - last_ms;
+  if (dt > 50) dt = 50;                      // the first call after DCS (or a long frame) must not jump
+  const float max_move = dt * GLIDE_PER_MS;
+  last_ms = ms;
+
+  const int clicks = controls::enc1.clicks.exchange(0);
+  controls::enc2.clicks.store(0);            // the altimeter setting has nothing to show here
+  const bool caged = controls::cage.stable.load();
+  const bool testing = controls::test.stable.load();
+
+  if (clicks || local_force) {
+    local_adj = (uint16_t)constrain((int)local_adj - clicks * ADJ_STEP, 0, 65535);
+    onSaiManPitchAdjChange(local_adj);
+    local_force = false;
+  }
+  const float flag_target = caged ? 65535.0f : (demo_active ? demo_flag : (float)live_val[L_FLAG]);
+  const float ver_target = testing ? (float)DCS_HALF : (demo_active ? demo_ver : (float)live_val[L_VER]);
+  const float hor_target = testing ? (float)DCS_HALF : (demo_active ? demo_hor : (float)live_val[L_HOR]);
+  if (g_flag.step(flag_target, max_move)) onSaiAttWarningFlagChange(g_flag.shown);
+  if (g_ver.step(ver_target, max_move)) onSaiPointerVerChange(g_ver.shown);
+  if (g_hor.step(hor_target, max_move)) onSaiPointerHorChange(g_hor.shown);
+}
+
 // Feeds the callbacks at ~30 Hz, the rate DCS-BIOS sends, so the load matches real use.
 static void demo_step(uint32_t ms) {
   static uint32_t last_demo_ms = 0;
@@ -435,24 +591,18 @@ static void demo_step(uint32_t ms) {
 
   const float t = ms / 1000.0f;
 
-#if SARI_DEMO_MODE != 3
   // pitch: full sweep in about 25 s
-  onSaiPitchChange((unsigned int)(32768.0f + 32000.0f * sinf(t * 0.25f)));
-#endif
-#if SARI_DEMO_MODE != 2
+  if (DEMO_VARIANT != 3) onSaiPitchChange((unsigned int)(32768.0f + 32000.0f * sinf(t * 0.25f)));
   // bank: one full revolution every 12 s
-  onSaiBankChange((unsigned int)(fmodf(t / 12.0f, 1.0f) * 65535.0f));
-#endif
+  if (DEMO_VARIANT != 2) onSaiBankChange((unsigned int)(fmodf(t / 12.0f, 1.0f) * 65535.0f));
   onSaiSlipBallChange((unsigned int)(32768.0f + 32000.0f * sinf(t * 0.7f)));
   onSaiRateOfTurnChange((unsigned int)(32768.0f + 32000.0f * sinf(t * 0.5f)));
-  onSaiManPitchAdjChange((unsigned int)(32768.0f + 32000.0f * sinf(t * 0.3f)));
   // OFF flag: swings across its full travel once every 8 s
-  onSaiAttWarningFlagChange((unsigned int)(32768.0f + 32767.0f * sinf(t * 0.785f)));
+  demo_flag = 32768.0f + 32767.0f * sinf(t * 0.785f);
   // ILS needles: each slides across its full travel, out of view at both ends
-  onSaiPointerVerChange((unsigned int)(32768.0f + 32767.0f * sinf(t * 0.6f)));
-  onSaiPointerHorChange((unsigned int)(32768.0f + 32767.0f * sinf(t * 0.45f)));
+  demo_ver = 32768.0f + 32767.0f * sinf(t * 0.6f);
+  demo_hor = 32768.0f + 32767.0f * sinf(t * 0.45f);
 }
-#endif
 
 // Runs LVGL's timers (animations) and, at LVGL's refresh period, one screen refresh.
 static void run_lvgl() {
@@ -467,9 +617,35 @@ static void run_lvgl() {
 
 void loop() {
   // LVGL reads millis() itself (LV_TICK_CUSTOM in lv_conf.h), so its tick keeps running during a draw.
-#if SARI_DEMO_MODE
-  demo_step(millis());
+#if !SARI_DEMO_MODE
+  // DCS is connected while DCS-BIOS bytes keep arriving. Until then (and for a while after they stop) the display stays
+  // as it is, with the local controls on it; after DEMO_AFTER_MS without any bytes the demo starts.
+  static uint32_t last_rx_ms = 0;          // counts from power-up until the first byte
+  static bool have_rx = false;
+  if (Serial.available()) { last_rx_ms = millis(); have_rx = true; }
+  const uint32_t quiet_ms = millis() - last_rx_ms;
+  const bool live_now = have_rx && quiet_ms < DCS_LIVE_MS;
+  const bool demo_now = !live_now && quiet_ms >= DEMO_AFTER_MS;
+  if (live_now != dcs_live) {
+    dcs_live = live_now;
+    controls::enc1.clicks.store(0);
+    controls::enc2.clicks.store(0);
+    if (dcs_live) { demo_active = false; restore_live(); }
+    else { local_adj = live_val[L_ADJ]; sync_glide(); }   // carry on from where DCS left things
+    local_force = true;
+  }
+  if (!dcs_live && demo_now != demo_active) {
+    demo_active = demo_now;
+    if (!demo_active) { restore_live(); sync_glide(); }
+    local_force = true;
+  }
 #endif
+  if (!dcs_live) {
+    in_local = true;
+    if (demo_active) demo_step(millis());
+    local_controls(millis());
+    in_local = false;
+  }
 
 #if SARI_PROFILE
   static uint32_t p_last = 0, p_lvgl_us = 0, p_frames = 0;
@@ -490,5 +666,6 @@ void loop() {
 #endif
 #if !SARI_DEMO_MODE
   DcsBios::loop();
+  if (dcs_live) controls::service();
 #endif
 }

@@ -1,0 +1,48 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "SARI: Compile",
+      "type": "process",
+      "command": "C:\\Program Files\\Arduino IDE\\resources\\app\\lib\\backend\\resources\\arduino-cli.exe",
+      "args": [
+        "--config-file", "${env:USERPROFILE}\\.arduinoIDE\\arduino-cli.yaml",
+        "compile",
+        "${workspaceFolder}"
+      ],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "SARI: Compile and Upload",
+      "type": "process",
+      "command": "C:\\Program Files\\Arduino IDE\\resources\\app\\lib\\backend\\resources\\arduino-cli.exe",
+      "args": [
+        "--config-file", "${env:USERPROFILE}\\.arduinoIDE\\arduino-cli.yaml",
+        "compile",
+        "--upload",
+        "--port", "${input:comPort}",
+        "${workspaceFolder}"
+      ],
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "SARI: List Ports",
+      "type": "process",
+      "command": "C:\\Program Files\\Arduino IDE\\resources\\app\\lib\\backend\\resources\\arduino-cli.exe",
+      "args": [
+        "--config-file", "${env:USERPROFILE}\\.arduinoIDE\\arduino-cli.yaml",
+        "board", "list"
+      ],
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "comPort",
+      "type": "promptString",
+      "description": "COM port of the SARI board",
+      "default": "COM11"
+    }
+  ]
+}

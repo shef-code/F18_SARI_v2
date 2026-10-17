@@ -1,0 +1,2 @@
+default_fqbn: esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=default,FlashMode=qio,CPUFreq=240
+default_port: COM11
