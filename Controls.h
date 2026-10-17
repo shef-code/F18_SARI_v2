@@ -27,9 +27,9 @@ constexpr int STEPS_PER_DETENT = 4;
 constexpr bool ENC1_REVERSE = false;
 constexpr bool ENC2_REVERSE = false;
 // Each click moves the DCS-BIOS control by this much (the full range is 65535).
-// SARI adjust knob: one degree of symbol travel, 6 px per degree against 70 px for 32768 counts = 2809 counts.
-constexpr const char *SARI_STEP_UP = "+2809";
-constexpr const char *SARI_STEP_DOWN = "-2809";
+// SARI adjust knob: one click of the in-game knob changes SAI_MAN_PITCH_ADJ by 1968 (3% of 65535), measured in DCS.
+constexpr const char *SARI_STEP_UP = "-1968";
+constexpr const char *SARI_STEP_DOWN = "+1968";
 // Barometer knob: the DCS-BIOS suggested step.
 constexpr const char *BARO_STEP_UP = "+3200";
 constexpr const char *BARO_STEP_DOWN = "-3200";

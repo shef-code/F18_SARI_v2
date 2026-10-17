@@ -40,7 +40,7 @@ extern "C" {
 // ────────────────────────────── Config ──────────────────────────────
 constexpr int  DISP_W = 480, DISP_H = 480;
 
-constexpr int  BUG_Y_OFFSET       = 17;
+constexpr int  BUG_Y_OFFSET       = 27;
 constexpr int  GLOBE_Y_OFFSET     = 33;
 constexpr int  BANK_Y_OFFSET      = 33;
 constexpr int  CAGED_X_OFFSET     = -157;
@@ -59,7 +59,9 @@ constexpr int  ROT_BASE_Y         = -200;
 constexpr int  GLOBE_CAL_X        = 0;
 constexpr int  GLOBE_CAL_Y        = 0;
 
-constexpr int BUG_MAX_TRAVEL_PX = 70;    
+constexpr int BUG_MAX_TRAVEL_PX = 80;     // clamp only
+constexpr int BUG_NEUTRAL = 34735;        // SAI_MAN_PITCH_ADJ with the symbol on the dead level horizon (measured in DCS)
+constexpr int BUG_COUNTS_PER_5DEG = 13776; // counts for 5 degrees (first minor tick): 7 game clicks, 20959 against 34735
 
 // ILS needles. A needle is centred at the middle of the DCS range and slides ILS_TRAVEL_PX each way; at either end
 // of the range it is out of the window, behind the bezel. Positive direction is +x / +y on the LVGL screen, which
@@ -180,10 +182,10 @@ DcsBios::IntegerBuffer saiRateOfTurnBuffer(0x74ee, 0xffff, 0, onSaiRateOfTurnCha
 
 void onSaiManPitchAdjChange(unsigned int v) {
   note(L_ADJ, v);
-  int delta = (int)v - (int)DCS_MID;
+  int delta = (int)v - BUG_NEUTRAL;
 
-  // Map DCS full deflection to ±70 px
-  int y = (DCS_HALF != 0) ? (delta * BUG_MAX_TRAVEL_PX / (int)DCS_HALF) : 0;
+  // Counts to pixels: 5 degrees is BUG_COUNTS_PER_5DEG counts and 5 * pitch_px_per_deg pixels
+  int y = (int)lrintf((float)delta * 5.0f * (float)pitch_px_per_deg / (float)BUG_COUNTS_PER_5DEG);
 
   // Clamp and apply your neutral offset
   y = constrain(y, -BUG_MAX_TRAVEL_PX, BUG_MAX_TRAVEL_PX) + BUG_Y_OFFSET;
@@ -499,7 +501,7 @@ void setup() {
   onSaiBankChange(DCS_MID);
   onSaiSlipBallChange(DCS_MID);
   onSaiRateOfTurnChange(DCS_MID);
-  onSaiManPitchAdjChange(DCS_MID);
+  onSaiManPitchAdjChange(BUG_NEUTRAL);
   onSaiAttWarningFlagChange(0);      // OFF flag out of view
   onSaiPointerVerChange(0);       // out of view (on the left) until DCS says otherwise
   onSaiPointerHorChange(65535);
@@ -523,14 +525,14 @@ constexpr int DEMO_VARIANT = SARI_DEMO_MODE;
 #else
 constexpr int DEMO_VARIANT = 1;
 #endif
-constexpr int ADJ_STEP = 2809;              // per click of the adjust knob, as it is sent to DCS
+constexpr int ADJ_STEP = 1968;              // per click of the adjust knob, as it is sent to DCS
 // Turning the knob clockwise moves the symbol this way while DCS is not connected; the minus sign in local_controls() sets it
 
 // Controls while DCS is not connected (the demo included). The adjust knob moves the aircraft symbol, the cage switch
 // puts the OFF flag in view while it is pulled, and the test button centres the ILS needles while it is held. The
 // flag and needles glide to their targets, and the demo only sets their targets, so they never jump.
 // Everything else stays as it was shown.
-static uint16_t local_adj = DCS_MID;        // aircraft symbol position
+static uint16_t local_adj = BUG_NEUTRAL;        // aircraft symbol position
 static bool local_force = true;             // apply the symbol position again
 constexpr float GLIDE_PER_MS = 65535.0f / 500.0f;   // full travel of the flag or a needle in 0.5 s
 
